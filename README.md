@@ -90,6 +90,16 @@ Add the standard config above to your Gemini CLI `settings.json`.
 | Sandbox objects | `CATALOG`, `DATABASE`, `TABLE`, `VIEW`, `STAGE`, `FUNCTION`, `USER`, `ROLE`, `TASK`, `PIPE`, `STREAM`, `CONNECTION`, `WAREHOUSE`, `SEQUENCE`, `PROCEDURE`, `DICTIONARY`, `TAG`, `FILE FORMAT`, `NETWORK POLICY`, `PASSWORD POLICY`, `MASKING POLICY`, `ROW ACCESS POLICY`, `NOTIFICATION INTEGRATION`, `WORKLOAD GROUP`, `DYNAMIC TABLE`, `INDEX` (AGGREGATING/INVERTED/NGRAM/VECTOR). |
 | Write rules | `CREATE/CREATE OR REPLACE/DROP/ALTER` on sandbox objects (every DROP/TRUNCATE target - a defensive check, the Databend parser itself rejects multi-target lists; plus `RENAME TO`/`SWAP WITH` destinations, where a bare name means "same database"); DML only on sandbox tables (`INSERT/UPDATE/DELETE/TRUNCATE/COPY/MERGE/REPLACE`); `GRANT/REVOKE` only on sandbox objects/principals and never on global wildcards; `ALTER ... SET|UNSET TAG` requires sandbox tag + target; `CREATE TASK|PIPE|DYNAMIC TABLE|INDEX ... AS` bodies are validated like top-level statements and `CREATE STREAM ... ON TABLE` only sandbox refs; `REMOVE @stage` only sandbox stages. |
 
+## Upgrade notes (0.4.0)
+
+This release is a minor bump because a few calls that used to be accepted are now rejected. Review the points below before upgrading.
+
+- **One statement per call.** `execute_sql` executes exactly one SQL statement; stacked `;`-separated statements are rejected by the gate instead of being forwarded to the engine. Use `execute_multi_sql` (which takes a list of statements) for batches. Scripts that relied on passing several statements in one call must be updated; the multi-statement error is now the gate's "Multiple SQL statements are not allowed in one call" message rather than the engine's `SyntaxException`.
+- **Tool arguments are parsed and rebuilt.** `database`, `table` and `stage` arguments accept plain identifiers, quoted identifiers (`` `my-db` ``, `"my-db"`), Databend's `$` character, and non-ASCII/space characters inside quotes. Stage arguments accept `@~` (user stage) and `@%table` (table stage). `filter` accepts a single SQL expression; `;` and `--` are only rejected outside a string literal, so values such as `name = 'a;b'` keep working. Argument validation applies even when `LAKE_MCP_SAFE_MODE=false`.
+- **`EXPLAIN` is read-only only when the statement it wraps is a read.** `EXPLAIN SELECT ...`, `EXPLAIN MEMO/PERF/DECORRELATED ...` and `EXPLAIN(...)` forms are allowed; `EXPLAIN ANALYZE DELETE ...` and `EXPLAIN DROP ...` are rejected.
+- **`WITH ... <write>` is allowed** as long as the write targets a sandbox object; objects referenced inside the CTE definition bodies are still validated by the same rules.
+- **`create_stage(connection_name=...)` is escaped as a string literal** instead of being validated as an identifier, so connection names containing `-`, `.` or `$` work again.
+
 ## Available Tools
 
 | Tool | Description |
