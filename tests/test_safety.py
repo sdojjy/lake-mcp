@@ -915,3 +915,47 @@ class TestMultiTargetWriteRules:
         prefix = get_session_prefix()
         sql = f"ALTER TABLE {prefix}db.t RENAME COLUMN a TO b"
         assert check_sql_safety(sql).allowed is True
+
+
+class TestDeferredBodies:
+    """TASK/PIPE/DYNAMIC TABLE bodies are validated by the full rule chain."""
+
+    @pytest.mark.parametrize(
+        "statement",
+        [
+            "CREATE TASK {p}t AS DROP TABLE production.users",
+            "CREATE TASK {p}t AS TRUNCATE TABLE production.events",
+            "CREATE TASK {p}t AS ALTER TABLE production.t DROP COLUMN c",
+            "CREATE TASK {p}t AS CREATE USER hacker IDENTIFIED BY 'x'",
+            "CREATE TASK {p}t AS GRANT ALL ON *.* TO hacker",
+            "CREATE TASK {p}t AS DROP DATABASE production",
+            "CREATE OR REPLACE TASK {p}t AS DROP TABLE production.users",
+            "CREATE PIPE {p}p AS ALTER TABLE production.t DROP COLUMN c",
+            "CREATE DYNAMIC TABLE {p}db.dt AS DROP DATABASE production",
+        ],
+    )
+    def test_non_sandbox_body_blocked(self, statement):
+        sql = statement.format(p=get_session_prefix())
+        result = check_sql_safety(sql)
+        assert result.allowed is False
+
+    @pytest.mark.parametrize(
+        "statement",
+        [
+            "CREATE TASK {p}t AS INSERT INTO {p}db.t VALUES (1)",
+            "CREATE TASK {p}t AS SELECT 1",
+            "CREATE OR REPLACE TASK {p}t AS INSERT INTO {p}db.t VALUES (1)",
+            "CREATE PIPE {p}p AS COPY INTO {p}db.t FROM @stage",
+            "CREATE DYNAMIC TABLE {p}db.dt AS SELECT * FROM {p}db.t",
+        ],
+    )
+    def test_sandbox_body_allowed(self, statement):
+        sql = statement.format(p=get_session_prefix())
+        assert check_sql_safety(sql).allowed is True
+
+    def test_deeply_nested_bodies_blocked(self):
+        prefix = get_session_prefix()
+        sql = ("CREATE TASK " + prefix + "t AS ") * 6 + "SELECT 1"
+        result = check_sql_safety(sql)
+        assert result.allowed is False
+        assert "Nested SQL" in result.reason

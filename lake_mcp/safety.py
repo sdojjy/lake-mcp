@@ -234,14 +234,9 @@ def _check_create_or_replace(sql: str, session_prefix: str) -> SafetyResult | No
     name, is_sandbox = _extract_identifier(obj_name, session_prefix)
     if is_sandbox:
         if obj_type in ("TASK", "PIPE") or "DYNAMIC TABLE" in obj_type:
-            as_match = re.search(r"\bAS\s+(.+)$", sql, re.IGNORECASE | re.DOTALL)
-            if as_match:
-                nested_sql = as_match.group(1).strip()
-                if _contains_non_sandbox_reference(nested_sql, session_prefix):
-                    return SafetyResult(
-                        allowed=False,
-                        reason=f"CREATE OR REPLACE {obj_type} blocked: Referenced object in nested SQL must start with {session_prefix}",
-                    )
+            nested_denial = _check_nested_body(sql, f"CREATE OR REPLACE {obj_type}", session_prefix)
+            if nested_denial is not None:
+                return nested_denial
         if obj_type == "STREAM":
             on_table_match = re.search(
                 rf"\bON\s+TABLE\s+({IDENTIFIER_PATTERN})",
@@ -425,26 +420,14 @@ def _check_create_drop(sql: str, session_prefix: str) -> SafetyResult | None:
                 reason=f"Operation blocked: '{name}' must start with {session_prefix}",
             )
 
-    # For TASK/PIPE, check nested SQL references
-    if obj_type in ("TASK", "PIPE"):
-        as_match = re.search(r"\bAS\s+(.+)$", sql, re.IGNORECASE | re.DOTALL)
-        if as_match:
-            nested_sql = as_match.group(1).strip()
-            if _contains_non_sandbox_reference(nested_sql, session_prefix):
-                return SafetyResult(
-                    allowed=False,
-                    reason=f"CREATE {obj_type} blocked: Referenced object in nested SQL must start with {session_prefix}",
-                )
-
-    if "DYNAMIC TABLE" in obj_type:
-        as_match = re.search(r"\bAS\s+(.+)$", sql, re.IGNORECASE | re.DOTALL)
-        if as_match:
-            nested_sql = as_match.group(1).strip()
-            if _contains_non_sandbox_reference(nested_sql, session_prefix):
-                return SafetyResult(
-                    allowed=False,
-                    reason=f"CREATE {obj_type} blocked: Referenced object in nested SQL must start with {session_prefix}",
-                )
+    # For TASK/PIPE/DYNAMIC TABLE, the deferred body must itself be allowed:
+    # the body runs later with the DSN principal's rights, so only checking its
+    # FROM/JOIN references would let "CREATE TASK t AS DROP TABLE production.x"
+    # (or a GRANT) through.
+    if obj_type in ("TASK", "PIPE") or "DYNAMIC TABLE" in obj_type:
+        nested_denial = _check_nested_body(sql, f"CREATE {obj_type}", session_prefix)
+        if nested_denial is not None:
+            return nested_denial
 
     # For STREAM, check ON TABLE reference
     if obj_type == "STREAM":
@@ -501,14 +484,9 @@ def _check_index(sql: str, session_prefix: str) -> SafetyResult | None:
                     reason=f"CREATE INDEX blocked: Referenced object '{name}' must start with {session_prefix}",
                 )
 
-        as_match = re.search(r"\bAS\s+(.+)$", sql, re.IGNORECASE | re.DOTALL)
-        if as_match:
-            nested_sql = as_match.group(1).strip()
-            if _contains_non_sandbox_reference(nested_sql, session_prefix):
-                return SafetyResult(
-                    allowed=False,
-                    reason=f"CREATE INDEX blocked: Referenced object in nested SQL must start with {session_prefix}",
-                )
+        nested_denial = _check_nested_body(sql, "CREATE INDEX", session_prefix)
+        if nested_denial is not None:
+            return nested_denial
 
         return SafetyResult(allowed=True)
 
