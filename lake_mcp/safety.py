@@ -787,10 +787,7 @@ def check_sql_safety(sql: str) -> SafetyResult:
     if len(statements) > 1:
         return SafetyResult(
             allowed=False,
-            reason=(
-                f"Multiple SQL statements are not allowed in one call (found {len(statements)}). "
-                "Submit each statement separately."
-            ),
+            reason=(f"Multiple SQL statements are not allowed in one call (found {len(statements)}). Submit each statement separately."),
         )
     return _check_single_statement(statements[0])
 
