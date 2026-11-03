@@ -66,13 +66,29 @@ def test_show_tables_rejects_injected_filter(monkeypatch):
     assert executed == []
 
 
-def test_show_tables_rejects_comment_in_filter(monkeypatch):
+def test_show_tables_allows_comment_markers_inside_filter_literal(monkeypatch):
+    """`--` inside a string literal is data, not a comment (compat regression B/R3)."""
     executed = _record_sql(monkeypatch)
 
-    result = server.show_tables(filter="1=1 --")
+    server.show_tables(filter="name = 'a--b'")
 
-    assert result["status"] == "error"
-    assert executed == []
+    assert executed == ["SHOW TABLES WHERE name = 'a--b'"]
+
+
+def test_show_tables_allows_semicolon_inside_filter_literal(monkeypatch):
+    executed = _record_sql(monkeypatch)
+
+    server.show_tables(filter="name = 'a;b'")
+
+    assert executed == ["SHOW TABLES WHERE name = 'a;b'"]
+
+
+def test_show_tables_allows_top_level_filter_comment(monkeypatch):
+    executed = _record_sql(monkeypatch)
+
+    server.show_tables(filter="1=1 -- trailing")
+
+    assert executed == ["SHOW TABLES WHERE 1=1 -- trailing"]
 
 
 def test_show_tables_builds_expected_statement(monkeypatch):
@@ -163,16 +179,191 @@ def test_create_stage_rejects_injected_name(monkeypatch):
     assert executed == []
 
 
-def test_create_stage_rejects_injected_connection_name(monkeypatch):
+def test_create_stage_escapes_connection_name_literal(monkeypatch):
+    """CONNECTION_NAME is a string literal, not an identifier (compat regression B4)."""
     executed = _record_sql(monkeypatch)
 
-    result = server.create_stage(
+    server.create_stage(
         name="mystage",
         url="s3://bucket",
         connection_name="c') ; DROP DATABASE production --",
     )
 
-    assert result["status"] == "error"
+    assert executed == [
+        "CREATE STAGE mystage URL = 's3://bucket' CONNECTION = (CONNECTION_NAME = 'c'') ; DROP DATABASE production --')",
+    ]
+
+
+def test_create_stage_accepts_shell_style_connection_name(monkeypatch):
+    executed = _record_sql(monkeypatch)
+
+    server.create_stage(name="mystage", url="s3://bucket", connection_name="my-conn")
+
+    assert executed == [
+        "CREATE STAGE mystage URL = 's3://bucket' CONNECTION = (CONNECTION_NAME = 'my-conn')",
+    ]
+
+
+def test_create_stage_accepts_dotted_connection_name(monkeypatch):
+    executed = _record_sql(monkeypatch)
+
+    server.create_stage(name="mystage", url="s3://bucket", connection_name="conn.prod")
+
+    assert executed == [
+        "CREATE STAGE mystage URL = 's3://bucket' CONNECTION = (CONNECTION_NAME = 'conn.prod')",
+    ]
+
+
+def test_show_tables_accepts_backtick_identifier(monkeypatch):
+    executed = _record_sql(monkeypatch)
+
+    server.show_tables(database="`my-db`")
+
+    assert executed == ["SHOW TABLES FROM `my-db`"]
+
+
+def test_show_tables_accepts_double_quoted_identifier(monkeypatch):
+    executed = _record_sql(monkeypatch)
+
+    server.show_tables(database='"my-db"')
+
+    assert executed == ["SHOW TABLES FROM `my-db`"]
+
+
+def test_show_tables_accepts_dollar_identifier(monkeypatch):
+    executed = _record_sql(monkeypatch)
+
+    server.show_tables(database="analytics$prod")
+
+    assert executed == ["SHOW TABLES FROM analytics$prod"]
+
+
+def test_describe_table_accepts_quoted_names(monkeypatch):
+    executed = _record_sql(monkeypatch)
+
+    server.describe_table(table="`my-table`")
+    server.describe_table(table="users", database="`analytics`")
+
+    assert executed == [
+        "DESCRIBE TABLE `my-table`",
+        "DESCRIBE TABLE `analytics`.users",
+    ]
+
+
+def test_describe_table_accepts_dollar_database(monkeypatch):
+    executed = _record_sql(monkeypatch)
+
+    server.describe_table(table="orders", database="analytics$prod")
+
+    assert executed == ["DESCRIBE TABLE analytics$prod.orders"]
+
+
+def test_list_stage_files_accepts_user_stage(monkeypatch):
+    executed = _record_sql(monkeypatch)
+
+    server.list_stage_files(stage_name="@~")
+
+    assert executed == ["LIST @~"]
+
+
+def test_list_stage_files_accepts_table_stage(monkeypatch):
+    executed = _record_sql(monkeypatch)
+
+    server.list_stage_files(stage_name="@%t")
+
+    assert executed == ["LIST @%t"]
+
+
+def test_list_stage_files_accepts_dollar_stage(monkeypatch):
+    executed = _record_sql(monkeypatch)
+
+    server.list_stage_files(stage_name="s$1")
+
+    assert executed == ["LIST @s$1"]
+
+
+def test_list_stage_files_accepts_non_ascii_and_space_in_path(monkeypatch):
+    executed = _record_sql(monkeypatch)
+
+    server.list_stage_files(stage_name="@~", path="dir/数据.csv")
+    server.list_stage_files(stage_name="mystage", path="dir/a b.csv")
+
+    assert executed == [
+        "LIST @~/dir/数据.csv",
+        "LIST @mystage/dir/a b.csv",
+    ]
+
+
+def test_create_stage_accepts_dollar_name(monkeypatch):
+    executed = _record_sql(monkeypatch)
+
+    server.create_stage(name="stage$1", url="s3://bucket")
+
+    assert executed == ["CREATE STAGE stage$1 URL = 's3://bucket'"]
+
+
+def test_create_stage_unquotes_simple_quoted_name(monkeypatch):
+    executed = _record_sql(monkeypatch)
+
+    server.create_stage(name="`mystage`", url="s3://bucket")
+
+    assert executed == ["CREATE STAGE mystage URL = 's3://bucket'"]
+
+
+def test_identifier_arguments_still_reject_statement_smuggling(monkeypatch):
+    """The relaxed identifier handling must not re-open injection."""
+    executed = _record_sql(monkeypatch)
+
+    for kwargs in (
+        {"database": "`my-db`; DROP DATABASE production"},
+        {"database": "`my-db`\nDROP DATABASE production"},
+        {"database": "`my-db` -- x"},
+        {"database": "`my-db``; DROP DATABASE production`"},
+    ):
+        result = server.show_tables(**kwargs)
+        assert result["status"] == "error"
+
+    for table in (
+        "`my-table`; DROP DATABASE production",
+        "x; CREATE USER evil IDENTIFIED BY 'p'",
+        "`my-table`\nDROP DATABASE production",
+    ):
+        result = server.describe_table(table=table)
+        assert result["status"] == "error"
+
+    assert executed == []
+
+
+def test_stage_arguments_still_reject_statement_smuggling(monkeypatch):
+    executed = _record_sql(monkeypatch)
+
+    for stage_name in (
+        "@~; DROP DATABASE production",
+        "@%t; DROP DATABASE production",
+        "@mystage`; DROP DATABASE production",
+    ):
+        result = server.list_stage_files(stage_name=stage_name)
+        assert result["status"] == "error"
+
+    for path in (
+        "data/x'; DROP DATABASE production --",
+        'data/x"; DROP DATABASE production --',
+        "data/x`; DROP DATABASE production",
+        "data/x\nDROP DATABASE production",
+    ):
+        result = server.list_stage_files(stage_name="mystage", path=path)
+        assert result["status"] == "error"
+
+    assert executed == []
+
+
+def test_create_stage_still_rejects_smuggled_name(monkeypatch):
+    executed = _record_sql(monkeypatch)
+
+    for name in ("s; DROP DATABASE production", "s`; DROP DATABASE production", "s\nDROP"):
+        result = server.create_stage(name=name, url="s3://bucket")
+        assert result["status"] == "error"
+
     assert executed == []
 
 
