@@ -632,6 +632,18 @@ def _check_grant_revoke(sql: str, session_prefix: str) -> SafetyResult | None:
     if not re.search(r"\b(GRANT|REVOKE)\b", sql, re.IGNORECASE):
         return None
 
+    # The global wildcard (* / *.*) carries no identifier for the checks below
+    # to inspect and would grant authority over the whole warehouse, so it is
+    # rejected outright. <db>.* stays allowed when <db> is a sandbox database.
+    on_clause = re.search(r"\bON\b(.*?)(?:\bTO\b|\bFROM\b|$)", sql, re.IGNORECASE | re.DOTALL)
+    if on_clause and "*" in on_clause.group(1):
+        target = on_clause.group(1).strip()
+        if not re.fullmatch(r"[`\'\"]?\w+[`\'\"]?\s*\.\s*\*", target):
+            return SafetyResult(
+                allowed=False,
+                reason=f"GRANT/REVOKE blocked: global wildcard target '{target}' is not allowed",
+            )
+
     grant_identifiers = []
 
     # Extract ON DATABASE/TABLE patterns - support db.table
@@ -646,10 +658,9 @@ def _check_grant_revoke(sql: str, session_prefix: str) -> SafetyResult | None:
         rf"\bON\s+PROCEDURE\s+({IDENTIFIER_PATTERN})",
         rf"\bON\s+MASKING\s+POLICY\s+({IDENTIFIER_PATTERN})",
         rf"\bON\s+ROW\s+ACCESS\s+POLICY\s+({IDENTIFIER_PATTERN})",
-        r'\bON\s+([`\'"]?\w+[`\'"]?)\.\\*',
+        r'\bON\s+([`\'"]?\w+[`\'"]?)\.\*',
     ]:
-        match = re.search(pattern, sql, re.IGNORECASE)
-        if match:
+        for match in re.finditer(pattern, sql, re.IGNORECASE):
             grant_identifiers.append(match.group(1))
 
     # Extract ROLE/TO/FROM patterns
@@ -658,8 +669,7 @@ def _check_grant_revoke(sql: str, session_prefix: str) -> SafetyResult | None:
         r'\bTO\s+([`\'"]?\w+[`\'"]?)',
         r'\bFROM\s+([`\'"]?\w+[`\'"]?)',
     ]:
-        match = re.search(pattern, sql, re.IGNORECASE)
-        if match:
+        for match in re.finditer(pattern, sql, re.IGNORECASE):
             grant_identifiers.append(match.group(1))
 
     # Check all extracted identifiers

@@ -815,3 +815,46 @@ class TestReadOnlyPrefixNarrowing:
     def test_cte_write_on_sandbox_allowed(self):
         sql = f"WITH cte AS (SELECT 1) DELETE FROM {get_session_prefix()}db.t"
         assert check_sql_safety(sql).allowed is True
+
+
+class TestGrantWildcard:
+    """A wildcard GRANT target must not slip past the identifier checks."""
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "GRANT ALL PRIVILEGES ON *.* TO mcp_sandbox_evil",
+            "GRANT ALL ON *.* TO mcp_sandbox_evil WITH GRANT OPTION",
+            "GRANT ALL ON *.* TO root",
+            "GRANT SELECT ON DATABASE * TO mcp_sandbox_user",
+            "REVOKE ALL ON *.* FROM mcp_sandbox_user",
+        ],
+    )
+    def test_global_wildcard_blocked(self, sql):
+        result = check_sql_safety(sql)
+        assert result.allowed is False
+
+    def test_global_wildcard_blocked_for_sandbox_grantee(self):
+        """The sandbox prefix on the grantee must not carry a global grant."""
+        prefix = get_session_prefix()
+        sql = f"GRANT ALL PRIVILEGES ON *.* TO {prefix}evil"
+        result = check_sql_safety(sql)
+        assert result.allowed is False
+        assert "wildcard" in result.reason
+
+    def test_sandbox_database_wildcard_allowed(self):
+        prefix = get_session_prefix()
+        sql = f"GRANT SELECT ON {prefix}db.* TO {prefix}user"
+        assert check_sql_safety(sql).allowed is True
+
+    def test_non_sandbox_database_wildcard_blocked(self):
+        prefix = get_session_prefix()
+        sql = f"GRANT SELECT ON production.* TO {prefix}user"
+        result = check_sql_safety(sql)
+        assert result.allowed is False
+        assert "production" in result.reason
+
+    def test_non_sandbox_grantee_with_sandbox_target_blocked(self):
+        prefix = get_session_prefix()
+        sql = f"GRANT SELECT ON DATABASE {prefix}db TO root"
+        assert check_sql_safety(sql).allowed is False
