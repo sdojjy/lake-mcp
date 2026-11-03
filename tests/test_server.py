@@ -385,3 +385,23 @@ def test_escaped_stage_url_keeps_statement_single(monkeypatch):
     assert executed == [
         f"CREATE STAGE {prefix}stage URL = 's3://bucket''; DROP DATABASE production --'",
     ]
+
+
+def test_show_tables_accepts_quoted_non_ascii_identifier(monkeypatch):
+    executed = _record_sql(monkeypatch)
+
+    server.show_tables(database="`订单`")
+    server.show_tables(database="`my db`")
+
+    assert executed == ["SHOW TABLES FROM `订单`", "SHOW TABLES FROM `my db`"]
+
+
+def test_quoted_identifier_cannot_escape_with_backslash_or_backtick(monkeypatch):
+    """Databend quoted identifiers have no backtick/backslash escape."""
+    executed = _record_sql(monkeypatch)
+
+    for database in ("`a\\`", "`a`b`", "`a``b`"):
+        result = server.show_tables(database=database)
+        assert result["status"] == "error"
+
+    assert executed == []
