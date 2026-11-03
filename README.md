@@ -85,6 +85,7 @@ Add the standard config above to your Gemini CLI `settings.json`.
 |-------|-------|
 | Read access | `SELECT/SHOW/DESCRIBE/EXPLAIN/LIST` on any object. `EXPLAIN`/`WITH` only stay read-only when the statement they wrap is a read. |
 | Statement scope | One statement per call. Stacked `;`-separated statements are rejected; use `execute_multi_sql` for batches. |
+| Tool arguments | `database`/`table`/`stage`/`connection` arguments are validated as SQL identifiers and URL/connection values are escaped before interpolation; `filter` accepts one expression only. |
 | Write access | Only objects prefixed with `mcp_sandbox_{session_id}_*`. |
 | Sandbox objects | `CATALOG`, `DATABASE`, `TABLE`, `VIEW`, `STAGE`, `FUNCTION`, `USER`, `ROLE`, `TASK`, `PIPE`, `STREAM`, `CONNECTION`, `WAREHOUSE`, `SEQUENCE`, `PROCEDURE`, `DICTIONARY`, `TAG`, `FILE FORMAT`, `NETWORK POLICY`, `PASSWORD POLICY`, `MASKING POLICY`, `ROW ACCESS POLICY`, `NOTIFICATION INTEGRATION`, `WORKLOAD GROUP`, `DYNAMIC TABLE`, `INDEX` (AGGREGATING/INVERTED/NGRAM/VECTOR). |
 | Write rules | `CREATE/CREATE OR REPLACE/DROP/ALTER` on sandbox objects; DML only on sandbox tables (`INSERT/UPDATE/DELETE/TRUNCATE/COPY/MERGE/REPLACE`); `GRANT/REVOKE` only on sandbox objects/principals; `ALTER ... SET|UNSET TAG` requires sandbox tag + target; `CREATE TASK|PIPE|DYNAMIC TABLE|INDEX ... AS` and `CREATE STREAM ... ON TABLE` only sandbox refs; `REMOVE @stage` only sandbox stages. |

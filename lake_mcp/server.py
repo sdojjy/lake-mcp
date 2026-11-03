@@ -37,6 +37,33 @@ mcp = FastMCP(SERVER_NAME)
 # Global Lake client singleton
 _lake_client = None
 
+# Tool arguments are interpolated into SQL text, so they are validated (or
+# escaped) here instead of being pasted in raw: the safety gate sees the
+# finished statement, and a `;` smuggled through an argument would otherwise
+# ride on the approval of the statement's read-only prefix.
+_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_QUALIFIED_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$")
+_STAGE_PATH_RE = re.compile(r"^[A-Za-z0-9_.*?=%+/\-]*$")
+_SQL_FRAGMENT_FORBIDDEN_RE = re.compile(r";|--|/\*|\*/")
+
+
+def _invalid_argument(argument: str, expected: str) -> dict:
+    """Build the error returned when a tool argument fails validation."""
+    return {"status": "error", "message": f"Invalid {argument}: {expected}"}
+
+
+def _is_identifier(value: str) -> bool:
+    return bool(_IDENTIFIER_RE.match(value))
+
+
+def _is_qualified_identifier(value: str) -> bool:
+    return bool(_QUALIFIED_IDENTIFIER_RE.match(value))
+
+
+def _escape_sql_literal(value: str) -> str:
+    """Escape a value that is placed inside a single-quoted SQL literal."""
+    return value.replace("\\", "\\\\").replace("'", "''")
+
 
 def get_global_lake_client():
     """Get global Lake client instance."""
@@ -214,8 +241,13 @@ def show_tables(database: Optional[str] = None, filter: Optional[str] = None):
     logger.info(f"Listing tables in database '{database}'")
     sql = "SHOW TABLES"
     if database is not None:
+        database = database.strip()
+        if not _is_qualified_identifier(database):
+            return _invalid_argument("database", "expected a SQL identifier, e.g. 'analytics' or 'analytics.events'")
         sql += f" FROM {database}"
     if filter is not None:
+        if not filter.strip() or _SQL_FRAGMENT_FORBIDDEN_RE.search(filter):
+            return _invalid_argument("filter", "expected a single SQL expression without ';' or comment markers")
         sql += f" WHERE {filter}"
     return _execute_sql(sql)
 
@@ -230,6 +262,8 @@ def show_functions(filter: Optional[str] = None):
     logger.info("Listing all functions")
     sql = "SHOW FUNCTIONS"
     if filter is not None:
+        if not filter.strip() or _SQL_FRAGMENT_FORBIDDEN_RE.search(filter):
+            return _invalid_argument("filter", "expected a single SQL expression without ';' or comment markers")
         sql += f" WHERE {filter}"
     return _execute_sql(sql)
 
@@ -245,7 +279,12 @@ def describe_table(table: str, database: Optional[str] = None):
         Dictionary containing either query results or error information
     """
     table = table.strip()
+    if not _is_qualified_identifier(table):
+        return _invalid_argument("table", "expected a SQL identifier, e.g. 'users' or 'analytics.users'")
     if database is not None:
+        database = database.strip()
+        if not _is_qualified_identifier(database):
+            return _invalid_argument("database", "expected a SQL identifier, e.g. 'analytics'")
         table = f"{database}.{table}"
     logger.info(f"Describing table '{table}'")
     sql = f"DESCRIBE TABLE {table}"
@@ -268,10 +307,17 @@ def list_stage_files(stage_name: str, path: Optional[str] = None):
     Returns:
         Dictionary containing either query results or error information
     """
-    if not stage_name.startswith("@"):
-        stage_name = f"@{stage_name}"
+    stage_name = stage_name.strip()
+    if stage_name.startswith("@"):
+        stage_name = stage_name[1:]
+    if not _is_qualified_identifier(stage_name):
+        return _invalid_argument("stage_name", "expected a stage name, e.g. 'mystage' or '@mystage'")
+    stage_name = f"@{stage_name}"
 
     if path:
+        path = path.strip()
+        if not _STAGE_PATH_RE.match(path):
+            return _invalid_argument("path", "expected a stage path made of letters, digits and _-./*?=%+")
         stage_path = f"{stage_name}/{path.strip('/')}"
     else:
         stage_path = stage_name
@@ -300,9 +346,18 @@ def create_stage(name: str, url: str, connection_name: Optional[str] = None) -> 
     """
     logger.info(f"Creating stage '{name}' with URL '{url}'")
 
-    sql_parts = [f"CREATE STAGE {name}", f"URL = '{url}'"]
+    name = name.strip()
+    if not _is_identifier(name):
+        return _invalid_argument("name", "expected a stage name, e.g. 'mystage'")
+    if not url or not url.strip():
+        return _invalid_argument("url", "expected a non-empty stage URL, e.g. 's3://bucket-name'")
+
+    sql_parts = [f"CREATE STAGE {name}", f"URL = '{_escape_sql_literal(url)}'"]
 
     if connection_name:
+        connection_name = connection_name.strip()
+        if not _is_identifier(connection_name):
+            return _invalid_argument("connection_name", "expected a connection name, e.g. 'myconnection'")
         sql_parts.append(f"CONNECTION = (CONNECTION_NAME = '{connection_name}')")
 
     sql = " ".join(sql_parts)
