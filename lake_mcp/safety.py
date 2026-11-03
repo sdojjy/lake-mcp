@@ -173,6 +173,48 @@ def _split_sql_statements(sql: str) -> list[str] | None:
     return [statement.strip() for statement in statements if statement.strip()]
 
 
+def has_top_level_separator(sql: str) -> bool:
+    """Return True when `sql` contains a ``;`` outside literals and comments.
+
+    Tool arguments that are interpolated as a SQL *expression* (the SHOW
+    ``filter``) may legitimately contain ``;``, ``--`` or ``/*`` inside a string
+    literal, so callers cannot just search the raw text. Unterminated literals or
+    comments count as a separator (fail closed).
+    """
+    index = 0
+    length = len(sql)
+    while index < length:
+        char = sql[index]
+        if char in _QUOTE_CHARS:
+            end = _skip_quoted(sql, index)
+            if end is None:
+                return True
+            index = end
+            continue
+        if char == "$":
+            dollar_match = _DOLLAR_QUOTE_RE.match(sql, index)
+            if dollar_match:
+                end = sql.find(dollar_match.group(0), dollar_match.end())
+                if end == -1:
+                    return True
+                index = end + len(dollar_match.group(0))
+                continue
+        if sql.startswith("--", index):
+            end = sql.find("\n", index)
+            index = length if end == -1 else end
+            continue
+        if sql.startswith("/*", index):
+            end = sql.find("*/", index + 2)
+            if end == -1:
+                return True
+            index = end + 2
+            continue
+        if char == ";":
+            return True
+        index += 1
+    return False
+
+
 def _extract_identifier(identifier: str, session_prefix: str) -> tuple[str, bool]:
     """Extract identifier and check if it's sandbox.
 
@@ -189,9 +231,31 @@ def _extract_identifier(identifier: str, session_prefix: str) -> tuple[str, bool
     return identifier, identifier.lower().startswith(session_prefix.lower())
 
 
+# CTE heads: `WITH [RECURSIVE] name [ (columns) ] AS (` and `, name [ (columns) ] AS (`.
+_CTE_HEAD_RE = re.compile(
+    r"(?:\bWITH\s+(?:RECURSIVE\s+)?|,\s*)([`\"]?\w+[`\"]?)\s*(?:\([^()]*\)\s*)?AS\s*\(",
+    re.IGNORECASE,
+)
+
+
+def _extract_cte_names(sql: str) -> set[str]:
+    """Collect the names defined by WITH clauses.
+
+    A CTE name is a local alias, not an external object reference; without this
+    ``WITH cte AS (SELECT 1) INSERT INTO sandbox.t SELECT * FROM cte`` would be
+    rejected because ``cte`` does not carry the sandbox prefix.
+    """
+    return {match.group(1).strip('`"').lower() for match in _CTE_HEAD_RE.finditer(sql)}
+
+
 def _contains_non_sandbox_reference(sql: str, session_prefix: str) -> bool:
-    """Check if SQL contains FROM/JOIN/INTO references to non-sandbox objects."""
+    """Check if SQL contains FROM/JOIN/INTO references to non-sandbox objects.
+
+    CTE names are skipped (they are aliases), while references inside the CTE
+    bodies are still inspected because the whole statement text is scanned.
+    """
     sql_clean = _normalize_sql(sql)
+    cte_names = _extract_cte_names(sql_clean)
 
     # Support db.table format
     ref_patterns = [
@@ -205,6 +269,8 @@ def _contains_non_sandbox_reference(sql: str, session_prefix: str) -> bool:
         for match in re.finditer(pattern, sql_clean, re.IGNORECASE):
             ref = match.group(1)
             if ref.upper() in ("SELECT", "VALUES", "USING"):
+                continue
+            if ref.strip("`'\"").lower() in cte_names:
                 continue
             _, is_sandbox = _extract_identifier(ref, session_prefix)
             if not is_sandbox:
@@ -312,7 +378,13 @@ _STATEMENT_VERBS = frozenset(
         "VACUUM",
     }
 )
-_EXPLAIN_OPTIONS = (
+# Databend grammar: EXPLAIN ~ ( explain_options | explain_verbose_alias )?
+#   ~ ( AST | SYNTAX | PIPELINE | JOIN | GRAPH | FRAGMENTS | RAW | OPTIMIZED
+#       | MEMO | DECORRELATED | PERF )? ~ statement
+# The option prefix only describes the plan output; what the policy cares about
+# is the statement it wraps, so the prefix is skipped and the wrapped statement
+# must still be read-only.
+_EXPLAIN_OPTION_KEYWORDS = (
     "ANALYZE",
     "AST",
     "SYNTAX",
@@ -322,11 +394,16 @@ _EXPLAIN_OPTIONS = (
     "FRAGMENTS",
     "RAW",
     "OPTIMIZED",
+    "MEMO",
+    "DECORRELATED",
+    "PERF",
+    "VERBOSE",
+    # Accepted historically; harmless synonyms for the plan format.
     "TREE",
     "JSON",
     "FORMAT",
 )
-_EXPLAIN_OPTIONS_RE = re.compile(rf"^(?:{'|'.join(_EXPLAIN_OPTIONS)})\b\s*")
+_EXPLAIN_OPTION_RE = re.compile(rf"^(?:{'|'.join(_EXPLAIN_OPTION_KEYWORDS)})\b\s*")
 _CTE_NAME_RE = re.compile(r"\s*(?:\([^)]*\)\s*)?AS\s*\(", re.IGNORECASE)
 
 
@@ -372,11 +449,27 @@ def _check_read_only(sql: str, session_prefix: str) -> SafetyResult | None:
 
     if re.match(r"^EXPLAIN\b", sql_upper):
         remainder = sql_upper[len("EXPLAIN") :].lstrip()
-        while True:
-            option = _EXPLAIN_OPTIONS_RE.match(remainder)
+        while remainder:
+            # Parenthesised option list: EXPLAIN(LOGICAL), EXPLAIN(VERBOSE, OPTIMIZED)
+            if remainder.startswith("("):
+                depth = 0
+                end = -1
+                for position, char in enumerate(remainder):
+                    if char == "(":
+                        depth += 1
+                    elif char == ")":
+                        depth -= 1
+                        if depth == 0:
+                            end = position
+                            break
+                if end == -1:
+                    return None
+                remainder = remainder[end + 1 :].lstrip()
+                continue
+            option = _EXPLAIN_OPTION_RE.match(remainder)
             if not option:
                 break
-            remainder = remainder[option.end() :]
+            remainder = remainder[option.end() :].lstrip()
         if not remainder:
             return None
         return _check_read_only(remainder, session_prefix)
@@ -569,6 +662,17 @@ def _check_tag_actions(sql: str, session_prefix: str) -> SafetyResult | None:
     return SafetyResult(allowed=True)
 
 
+def _is_qualified_name(name: str) -> bool:
+    """True when the identifier text is database-qualified (``db.table``)."""
+    name = name.strip()
+    if not name:
+        return False
+    if name[0] in _QUOTE_CHARS:
+        # A single quoted identifier may contain a dot but is not qualified.
+        return False
+    return "." in name
+
+
 def _check_alter(sql: str, session_prefix: str) -> SafetyResult | None:
     """Rule: ALTER operations must be on sandbox objects."""
     match = re.search(
@@ -579,7 +683,10 @@ def _check_alter(sql: str, session_prefix: str) -> SafetyResult | None:
     if not match:
         return None
 
+    obj_type = match.group(1).upper()
     obj_name = match.group(2)
+    source_is_qualified = _is_qualified_name(obj_name)
+
     name, is_sandbox = _extract_identifier(obj_name, session_prefix)
     if not is_sandbox:
         return SafetyResult(
@@ -592,12 +699,30 @@ def _check_alter(sql: str, session_prefix: str) -> SafetyResult | None:
     # and "ALTER TABLE sandbox.t SWAP WITH production.users" write outside it.
     for keyword in ("RENAME TO", "SWAP WITH"):
         for dest_match in re.finditer(rf"\b{keyword}\s+({IDENTIFIER_PATTERN})", sql, re.IGNORECASE):
-            dest_name, dest_is_sandbox = _extract_identifier(dest_match.group(1), session_prefix)
-            if not dest_is_sandbox:
-                return SafetyResult(
-                    allowed=False,
-                    reason=f"ALTER {keyword} blocked: '{dest_name}' must start with {session_prefix}",
-                )
+            destination = dest_match.group(1)
+            dest_name, dest_is_sandbox = _extract_identifier(destination, session_prefix)
+            if _is_qualified_name(destination):
+                if not dest_is_sandbox:
+                    return SafetyResult(
+                        allowed=False,
+                        reason=f"ALTER {keyword} blocked: '{dest_name}' must start with {session_prefix}",
+                    )
+                continue
+            # Databend only accepts a bare destination ("RENAME TO t2"), which
+            # stays in the source object's database. That is safe when the
+            # destination already carries the prefix, or when the source is
+            # database-qualified so its database is the known sandbox one.
+            if dest_is_sandbox:
+                continue
+            if obj_type in ("TABLE", "VIEW") and source_is_qualified:
+                continue
+            return SafetyResult(
+                allowed=False,
+                reason=(
+                    f"ALTER {keyword} blocked: '{dest_name}' must start with {session_prefix} "
+                    f"(or use a database-qualified source so the destination stays in the sandbox database)"
+                ),
+            )
 
     return SafetyResult(allowed=True)
 

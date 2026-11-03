@@ -1001,3 +1001,109 @@ class TestGrantTargetCoverage:
     def test_sandbox_targets_still_allowed(self, statement):
         sql = statement.format(p=get_session_prefix())
         assert check_sql_safety(sql).allowed is True
+
+
+class TestExplainVariants:
+    """Valid Databend EXPLAIN variants must stay read-only (compat regression B5)."""
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "EXPLAIN SELECT * FROM production.users",
+            "EXPLAIN ANALYZE SELECT 1",
+            "EXPLAIN AST SELECT 1",
+            "EXPLAIN SYNTAX SELECT 1",
+            "EXPLAIN OPTIMIZED SELECT 1",
+            "EXPLAIN MEMO SELECT 1",
+            "EXPLAIN PERF SELECT 1",
+            "EXPLAIN DECORRELATED SELECT 1",
+            "EXPLAIN(LOGICAL) SELECT 1",
+            "EXPLAIN(VERBOSE, OPTIMIZED) SELECT 1",
+            "EXPLAIN (LOGICAL) SELECT 1",
+        ],
+    )
+    def test_read_explain_variants_allowed(self, sql):
+        assert check_sql_safety(sql).allowed is True
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "EXPLAIN DROP DATABASE production",
+            "EXPLAIN ANALYZE DELETE FROM production.users",
+            "EXPLAIN MEMO DROP TABLE production.users",
+            "EXPLAIN(LOGICAL) CREATE USER evil IDENTIFIED BY 'x'",
+        ],
+    )
+    def test_explain_of_write_still_blocked(self, sql):
+        assert check_sql_safety(sql).allowed is False
+
+
+class TestCteWrites:
+    """CTE names are aliases, not non-sandbox references (compat regression B6)."""
+
+    def test_cte_insert_into_sandbox_allowed(self):
+        prefix = get_session_prefix()
+        sql = f"WITH cte AS (SELECT 1) INSERT INTO {prefix}db.t SELECT * FROM cte"
+        assert check_sql_safety(sql).allowed is True
+
+    def test_cte_update_sandbox_allowed(self):
+        prefix = get_session_prefix()
+        sql = f"WITH cte AS (SELECT 2) UPDATE {prefix}db.t SET a = 2 WHERE a IN (SELECT * FROM cte)"
+        assert check_sql_safety(sql).allowed is True
+
+    def test_cte_delete_sandbox_allowed(self):
+        prefix = get_session_prefix()
+        sql = f"WITH cte AS (SELECT 1) DELETE FROM {prefix}db.t WHERE a IN (SELECT * FROM cte)"
+        assert check_sql_safety(sql).allowed is True
+
+    def test_multiple_ctes_allowed(self):
+        prefix = get_session_prefix()
+        sql = f"WITH a AS (SELECT 1), b AS (SELECT * FROM a) INSERT INTO {prefix}db.t SELECT * FROM b"
+        assert check_sql_safety(sql).allowed is True
+
+    def test_cte_body_reference_to_non_sandbox_still_blocked(self):
+        prefix = get_session_prefix()
+        sql = f"WITH cte AS (SELECT * FROM production.users) INSERT INTO {prefix}db.t SELECT * FROM cte"
+        result = check_sql_safety(sql)
+        assert result.allowed is False
+        assert "non-sandbox" in result.reason
+
+    def test_cte_write_on_non_sandbox_target_still_blocked(self):
+        sql = "WITH cte AS (SELECT 1) INSERT INTO production.users SELECT * FROM cte"
+        assert check_sql_safety(sql).allowed is False
+
+
+class TestAlterRenameDestinations:
+    """Bare RENAME TO / SWAP WITH destinations mean "same database" (compat regression R2)."""
+
+    def test_bare_rename_from_qualified_sandbox_table_allowed(self):
+        prefix = get_session_prefix()
+        sql = f"ALTER TABLE {prefix}db.t RENAME TO t2"
+        assert check_sql_safety(sql).allowed is True
+
+    def test_bare_swap_from_qualified_sandbox_table_allowed(self):
+        prefix = get_session_prefix()
+        sql = f"ALTER TABLE {prefix}db.t SWAP WITH t3"
+        assert check_sql_safety(sql).allowed is True
+
+    def test_bare_rename_from_bare_sandbox_table_blocked(self):
+        # Without a database-qualified source the destination cannot be shown to
+        # stay inside the sandbox database.
+        prefix = get_session_prefix()
+        sql = f"ALTER TABLE {prefix}t RENAME TO t2"
+        assert check_sql_safety(sql).allowed is False
+
+    def test_prefixed_bare_destination_allowed(self):
+        prefix = get_session_prefix()
+        sql = f"ALTER TABLE {prefix}t RENAME TO {prefix}t2"
+        assert check_sql_safety(sql).allowed is True
+
+    def test_qualified_non_sandbox_destination_blocked(self):
+        prefix = get_session_prefix()
+        sql = f"ALTER TABLE {prefix}db.t RENAME TO production.pwned"
+        assert check_sql_safety(sql).allowed is False
+
+    def test_database_rename_to_non_sandbox_blocked(self):
+        prefix = get_session_prefix()
+        sql = f"ALTER DATABASE {prefix}db RENAME TO production"
+        assert check_sql_safety(sql).allowed is False
