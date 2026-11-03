@@ -622,47 +622,152 @@ def _check_optimize_vacuum(sql: str, session_prefix: str) -> SafetyResult | None
     )
 
 
+_GRANT_TARGET_KEYWORDS = frozenset(
+    {
+        "ACCESS",
+        "ALL",
+        "CATALOG",
+        "CATALOGS",
+        "CONNECTION",
+        "CONNECTIONS",
+        "DATABASE",
+        "DATABASES",
+        "FILE",
+        "FORMAT",
+        "FORMATS",
+        "FUTURE",
+        "GROUP",
+        "GROUPS",
+        "IN",
+        "INTEGRATION",
+        "INTEGRATIONS",
+        "MASKING",
+        "NETWORK",
+        "NOTIFICATION",
+        "OBJECTS",
+        "ON",
+        "PASSWORD",
+        "POLICIES",
+        "POLICY",
+        "PRIVILEGES",
+        "PROCEDURE",
+        "PROCEDURES",
+        "ROW",
+        "SCHEMA",
+        "SCHEMAS",
+        "SEQUENCE",
+        "SEQUENCES",
+        "STAGE",
+        "STAGES",
+        "TABLE",
+        "TABLES",
+        "TAG",
+        "TAGS",
+        "UDF",
+        "UDFS",
+        "VIEW",
+        "VIEWS",
+        "WAREHOUSE",
+        "WAREHOUSES",
+        "WORKLOAD",
+    }
+)
+
+
+def _grant_target_identifiers(target: str) -> list[str] | None:
+    """Collect the object identifiers named in a GRANT/REVOKE ``ON`` clause.
+
+    Object-type keywords are skipped; quoted names are always identifiers, so a
+    database literally called ``"tables"`` is still checked. Returns None when
+    the clause cannot be tokenized.
+    """
+    identifiers: list[str] = []
+    index = 0
+    length = len(target)
+    while index < length:
+        char = target[index]
+        if char.isspace() or char == ",":
+            index += 1
+            continue
+        if char in _QUOTE_CHARS:
+            end = _skip_quoted(target, index)
+            if end is None:
+                return None
+            identifiers.append(target[index:end])
+            index = end
+            continue
+        if char.isalpha() or char == "_":
+            start = index
+            end = index
+            while end < length and (target[end].isalnum() or target[end] in "_$"):
+                end += 1
+            token = target[start:end]
+            if end < length and target[end] == "." and end + 1 < length and (target[end + 1].isalnum() or target[end + 1] in "_$"):
+                tail = _read_qualified_tail(target, end)
+                identifiers.append(token + tail)
+                index = end + len(tail)
+            else:
+                if token.upper() not in _GRANT_TARGET_KEYWORDS:
+                    identifiers.append(token)
+                index = end
+            continue
+        index += 1
+    return identifiers
+
+
+def _read_qualified_tail(target: str, index: int) -> str:
+    """Read the ``.name`` tail of a qualified identifier starting at `index`."""
+    tail = ""
+    length = len(target)
+    while index < length and target[index] == ".":
+        tail += "."
+        index += 1
+        while index < length and (target[index].isalnum() or target[index] in "_$"):
+            tail += target[index]
+            index += 1
+    return tail
+
+
 def _check_grant_revoke(sql: str, session_prefix: str) -> SafetyResult | None:
     """Rule: GRANT/REVOKE - all involved objects must be sandbox."""
     if not re.search(r"\b(GRANT|REVOKE)\b", sql, re.IGNORECASE):
         return None
 
-    # The global wildcard (* / *.*) carries no identifier for the checks below
-    # to inspect and would grant authority over the whole warehouse, so it is
-    # rejected outright. <db>.* stays allowed when <db> is a sandbox database.
+    grant_identifiers: list[str] = []
+
     on_clause = re.search(r"\bON\b(.*?)(?:\bTO\b|\bFROM\b|$)", sql, re.IGNORECASE | re.DOTALL)
-    if on_clause and "*" in on_clause.group(1):
-        target = on_clause.group(1).strip()
-        if not re.fullmatch(r"[`\'\"]?\w+[`\'\"]?\s*\.\s*\*", target):
+    if on_clause:
+        target = on_clause.group(1)
+        # The global wildcard (* / *.*) carries no identifier for the checks
+        # below to inspect and would grant authority over the whole warehouse,
+        # so it is rejected outright. <db>.* is inspected through its database.
+        if "*" in target and not re.fullmatch(r"\s*[`\'\"]?\w+[`\'\"]?\s*\.\s*\*\s*", target):
             return SafetyResult(
                 allowed=False,
-                reason=f"GRANT/REVOKE blocked: global wildcard target '{target}' is not allowed",
+                reason=f"GRANT/REVOKE blocked: global wildcard target '{target.strip()}' is not allowed",
             )
+        on_identifiers = _grant_target_identifiers(target)
+        if on_identifiers is None:
+            return SafetyResult(
+                allowed=False,
+                reason="GRANT/REVOKE blocked: ON clause could not be tokenized safely",
+            )
+        grant_identifiers.extend(on_identifiers)
 
-    grant_identifiers = []
-
-    # Extract ON DATABASE/TABLE patterns - support db.table
-    for pattern in [
-        rf"\bON\s+DATABASE\s+({IDENTIFIER_PATTERN})",
-        rf"\bON\s+WAREHOUSE\s+({IDENTIFIER_PATTERN})",
-        rf"\bON\s+TABLE\s+({IDENTIFIER_PATTERN})",
-        rf"\bON\s+STAGE\s+({IDENTIFIER_PATTERN})",
-        rf"\bON\s+UDF\s+({IDENTIFIER_PATTERN})",
-        rf"\bON\s+CONNECTION\s+({IDENTIFIER_PATTERN})",
-        rf"\bON\s+SEQUENCE\s+({IDENTIFIER_PATTERN})",
-        rf"\bON\s+PROCEDURE\s+({IDENTIFIER_PATTERN})",
-        rf"\bON\s+MASKING\s+POLICY\s+({IDENTIFIER_PATTERN})",
-        rf"\bON\s+ROW\s+ACCESS\s+POLICY\s+({IDENTIFIER_PATTERN})",
-        r'\bON\s+([`\'"]?\w+[`\'"]?)\.\*',
-    ]:
-        for match in re.finditer(pattern, sql, re.IGNORECASE):
-            grant_identifiers.append(match.group(1))
+    # A wildcard outside an object reference ("TO *", "ON *") names no
+    # identifier this rule can inspect, so it is rejected.
+    for star in re.finditer(r"\*", sql):
+        if not re.search(r"[`'\"]?\w+[`'\"]?\s*\.\s*$", sql[: star.start()]):
+            return SafetyResult(
+                allowed=False,
+                reason="GRANT/REVOKE blocked: wildcard is only supported as '<sandbox_object>.*'",
+            )
 
     # Extract ROLE/TO/FROM patterns
     for pattern in [
-        r'\bROLE\s+([`\'"]?\w+[`\'"]?)',
-        r'\bTO\s+([`\'"]?\w+[`\'"]?)',
-        r'\bFROM\s+([`\'"]?\w+[`\'"]?)',
+        r"\bROLE\s+([`\'\"]?\w+[`\'\"]?)",
+        r"\bTO\s+([`\'\"]?\w+[`\'\"]?)",
+        r"\bFROM\s+([`\'\"]?\w+[`\'\"]?)",
     ]:
         for match in re.finditer(pattern, sql, re.IGNORECASE):
             grant_identifiers.append(match.group(1))

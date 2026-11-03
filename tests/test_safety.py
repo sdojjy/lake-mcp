@@ -959,3 +959,45 @@ class TestDeferredBodies:
         result = check_sql_safety(sql)
         assert result.allowed is False
         assert "Nested SQL" in result.reason
+
+
+class TestGrantTargetCoverage:
+    """Every object class in an ON clause is checked, not a fixed list of them."""
+
+    @pytest.mark.parametrize(
+        "statement",
+        [
+            "GRANT SELECT ON VIEW production.v TO {p}user",
+            "GRANT SELECT ON TAG production.tag TO {p}user",
+            "GRANT SELECT ON CATALOG prod_cat TO {p}user",
+            "GRANT SELECT ON FILE FORMAT prod_ff TO {p}user",
+            'GRANT SELECT ON DATABASE "tables" TO {p}user',
+            "GRANT SELECT ON ALL TABLES IN SCHEMA production TO {p}user",
+        ],
+    )
+    def test_any_object_class_checked(self, statement):
+        sql = statement.format(p=get_session_prefix())
+        result = check_sql_safety(sql)
+        assert result.allowed is False
+
+    def test_wildcard_outside_object_reference_blocked(self):
+        prefix = get_session_prefix()
+        sql = f"GRANT SELECT ON DATABASE {prefix}db TO *"
+        result = check_sql_safety(sql)
+        assert result.allowed is False
+        assert "wildcard" in result.reason
+
+    @pytest.mark.parametrize(
+        "statement",
+        [
+            "GRANT SELECT ON DATABASE {p}db TO {p}user",
+            "GRANT SELECT ON TABLE {p}db.t TO {p}user",
+            "GRANT USAGE ON WAREHOUSE {p}wh TO {p}user",
+            "GRANT SELECT ON ALL TABLES IN SCHEMA {p}db TO {p}user",
+            "GRANT ROLE {p}role TO {p}user",
+            "REVOKE SELECT ON DATABASE {p}db FROM {p}user",
+        ],
+    )
+    def test_sandbox_targets_still_allowed(self, statement):
+        sql = statement.format(p=get_session_prefix())
+        assert check_sql_safety(sql).allowed is True
