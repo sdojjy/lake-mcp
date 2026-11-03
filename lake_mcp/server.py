@@ -11,7 +11,7 @@ from fastmcp import FastMCP
 from fastmcp.tools import Tool
 
 from .env import TransportType, get_config
-from .safety import SESSION_ID, check_sql_safety, get_session_prefix
+from .safety import SESSION_ID, check_sql_safety, get_session_prefix, has_top_level_separator
 
 # Constants
 SERVER_NAME = "lake-mcp"
@@ -36,6 +36,124 @@ mcp = FastMCP(SERVER_NAME)
 
 # Global Lake client singleton
 _lake_client = None
+
+# Tool arguments are interpolated into SQL text, so they are normalized here
+# instead of being pasted in raw: the safety gate sees the finished statement,
+# and a `;` smuggled through an argument would otherwise ride on the approval of
+# the statement's read-only prefix. Quoted identifiers (`` `my-db` `` or
+# `` "my-db" ``) and Databend's `` $ `` identifier character are accepted and
+# re-emitted in a canonical, injection-safe form.
+_IDENTIFIER_UNQUOTED_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*$")
+_IDENTIFIER_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
+_STAGE_PATH_FORBIDDEN_RE = re.compile(r"[;'\"`\x00-\x1f\x7f]")
+
+
+def _invalid_argument(argument: str, expected: str) -> dict:
+    """Build the error returned when a tool argument fails validation."""
+    return {"status": "error", "message": f"Invalid {argument}: {expected}"}
+
+
+def _split_identifier_parts(value: str) -> list[tuple[str, bool]] | None:
+    """Split ``db.table`` style text into ``(content, was_quoted)`` parts."""
+    if not value:
+        return None
+    parts: list[tuple[str, bool]] = []
+    index = 0
+    length = len(value)
+    while True:
+        char = value[index] if index < length else ""
+        if char in ("`", '"'):
+            quote = char
+            index += 1
+            content_chars: list[str] = []
+            closed = False
+            while index < length:
+                current = value[index]
+                if current == quote:
+                    if index + 1 < length and value[index + 1] == quote:
+                        content_chars.append(quote)
+                        index += 2
+                        continue
+                    index += 1
+                    closed = True
+                    break
+                content_chars.append(current)
+                index += 1
+            if not closed:
+                return None
+            content = "".join(content_chars)
+            if not content:
+                return None
+            parts.append((content, True))
+        else:
+            start = index
+            while index < length and value[index] != ".":
+                index += 1
+            content = value[start:index]
+            if not content:
+                return None
+            parts.append((content, False))
+        if index >= length:
+            return parts
+        if value[index] != ".":
+            return None
+        index += 1
+        if index >= length:
+            return None
+
+
+def _render_identifier(value: str, *, allow_qualified: bool = True, unquoted_only: bool = False) -> str | None:
+    """Return ``value`` as an injection-safe SQL identifier, or None if invalid.
+
+    Unquoted parts must match Databend's plain identifier syntax
+    (``[_a-zA-Z][_$a-zA-Z0-9]*``). Quoted parts are re-emitted with backticks
+    after rejecting characters that cannot be represented safely there.
+    """
+    parts = _split_identifier_parts(value.strip())
+    if not parts:
+        return None
+    if not allow_qualified and len(parts) > 1:
+        return None
+    rendered: list[str] = []
+    for content, was_quoted in parts:
+        if not was_quoted:
+            if not _IDENTIFIER_UNQUOTED_RE.match(content):
+                return None
+            rendered.append(content)
+            continue
+        if unquoted_only:
+            # e.g. CREATE STAGE only accepts a plain (unquoted) identifier.
+            if not _IDENTIFIER_UNQUOTED_RE.match(content):
+                return None
+            rendered.append(content)
+            continue
+        # Databend quoted identifiers have no escape for a backtick, and a
+        # backslash or a second statement separator must never be pasted in.
+        if _IDENTIFIER_CONTROL_RE.search(content) or any(char in content for char in (";", "`", "\\")):
+            return None
+        rendered.append(f"`{content}`")
+    return ".".join(rendered)
+
+
+def _render_stage_reference(stage_name: str) -> str | None:
+    """Return an injection-safe ``LIST`` stage reference (``@stage``, ``@~``, ``@%table``)."""
+    name = stage_name.strip()
+    if name.startswith("@"):
+        name = name[1:]
+    if not name:
+        return None
+    if name == "~":
+        return "@~"
+    if name.startswith("%"):
+        table = _render_identifier(name[1:], unquoted_only=True)
+        return None if table is None else f"@%{table}"
+    stage = _render_identifier(name, unquoted_only=True)
+    return None if stage is None else f"@{stage}"
+
+
+def _escape_sql_literal(value: str) -> str:
+    """Escape a value that is placed inside a single-quoted SQL literal."""
+    return value.replace("\\", "\\\\").replace("'", "''")
 
 
 def get_global_lake_client():
@@ -214,8 +332,16 @@ def show_tables(database: Optional[str] = None, filter: Optional[str] = None):
     logger.info(f"Listing tables in database '{database}'")
     sql = "SHOW TABLES"
     if database is not None:
-        sql += f" FROM {database}"
+        rendered = _render_identifier(database)
+        if rendered is None:
+            return _invalid_argument(
+                "database",
+                "expected a SQL identifier, e.g. 'analytics', 'analytics.events' or '`my-db`'",
+            )
+        sql += f" FROM {rendered}"
     if filter is not None:
+        if not filter.strip() or has_top_level_separator(filter):
+            return _invalid_argument("filter", "expected a single SQL expression (no ';' outside a string literal)")
         sql += f" WHERE {filter}"
     return _execute_sql(sql)
 
@@ -230,6 +356,8 @@ def show_functions(filter: Optional[str] = None):
     logger.info("Listing all functions")
     sql = "SHOW FUNCTIONS"
     if filter is not None:
+        if not filter.strip() or has_top_level_separator(filter):
+            return _invalid_argument("filter", "expected a single SQL expression (no ';' outside a string literal)")
         sql += f" WHERE {filter}"
     return _execute_sql(sql)
 
@@ -244,11 +372,16 @@ def describe_table(table: str, database: Optional[str] = None):
     Returns:
         Dictionary containing either query results or error information
     """
-    table = table.strip()
+    rendered_table = _render_identifier(table)
+    if rendered_table is None:
+        return _invalid_argument("table", "expected a SQL identifier, e.g. 'users', 'analytics.users' or '`my-table`'")
     if database is not None:
-        table = f"{database}.{table}"
-    logger.info(f"Describing table '{table}'")
-    sql = f"DESCRIBE TABLE {table}"
+        rendered_database = _render_identifier(database)
+        if rendered_database is None:
+            return _invalid_argument("database", "expected a SQL identifier, e.g. 'analytics' or '`my-db`'")
+        rendered_table = f"{rendered_database}.{rendered_table}"
+    logger.info(f"Describing table '{rendered_table}'")
+    sql = f"DESCRIBE TABLE {rendered_table}"
     return _execute_sql(sql)
 
 
@@ -268,13 +401,20 @@ def list_stage_files(stage_name: str, path: Optional[str] = None):
     Returns:
         Dictionary containing either query results or error information
     """
-    if not stage_name.startswith("@"):
-        stage_name = f"@{stage_name}"
+    stage_reference = _render_stage_reference(stage_name)
+    if stage_reference is None:
+        return _invalid_argument(
+            "stage_name",
+            "expected a stage name, e.g. 'mystage', '@mystage', '@~' or '@%table'",
+        )
 
     if path:
-        stage_path = f"{stage_name}/{path.strip('/')}"
+        path = path.strip()
+        if _STAGE_PATH_FORBIDDEN_RE.search(path):
+            return _invalid_argument("path", "expected a stage path without ';', quotes or control characters")
+        stage_path = f"{stage_reference}/{path.strip('/')}"
     else:
-        stage_path = stage_name
+        stage_path = stage_reference
 
     logger.info(f"Listing files in stage '{stage_path}'")
     sql = f"LIST {stage_path}"
@@ -300,10 +440,18 @@ def create_stage(name: str, url: str, connection_name: Optional[str] = None) -> 
     """
     logger.info(f"Creating stage '{name}' with URL '{url}'")
 
-    sql_parts = [f"CREATE STAGE {name}", f"URL = '{url}'"]
+    rendered_name = _render_identifier(name, allow_qualified=False, unquoted_only=True)
+    if rendered_name is None:
+        return _invalid_argument("name", "expected a stage name, e.g. 'mystage' or 's$1'")
+    if not url or not url.strip():
+        return _invalid_argument("url", "expected a non-empty stage URL, e.g. 's3://bucket-name'")
+
+    sql_parts = [f"CREATE STAGE {rendered_name}", f"URL = '{_escape_sql_literal(url)}'"]
 
     if connection_name:
-        sql_parts.append(f"CONNECTION = (CONNECTION_NAME = '{connection_name}')")
+        # CONNECTION_NAME is a string literal, not an identifier: a connection
+        # named `my-conn` / `conn.prod` is valid and must be escaped, not rejected.
+        sql_parts.append(f"CONNECTION = (CONNECTION_NAME = '{_escape_sql_literal(connection_name)}')")
 
     sql = " ".join(sql_parts)
     return _execute_sql(sql)

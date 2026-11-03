@@ -15,6 +15,7 @@ ARCHITECTURE: Modular rule-based system
 
 import re
 import secrets
+import threading
 from dataclasses import dataclass
 from typing import Callable
 
@@ -22,7 +23,12 @@ from typing import Callable
 SESSION_ID = secrets.token_hex(4)
 SANDBOX_PREFIX = "mcp_sandbox_"
 
+# Maximum nesting of deferred statements (TASK/PIPE/DYNAMIC TABLE bodies).
+MAX_NESTED_SQL_DEPTH = 3
+
 IDENTIFIER_PATTERN = r"[`\'\"]?\w+[`\'\"]?(?:\.[`\'\"]?\w+[`\'\"]?)?"
+# DROP/TRUNCATE accept comma-separated target lists; every target must be checked.
+IDENTIFIER_LIST_PATTERN = rf"{IDENTIFIER_PATTERN}(?:\s*,\s*{IDENTIFIER_PATTERN})*"
 INDEX_TYPE_PATTERN = r"(?:AGGREGATING|INVERTED|NGRAM|VECTOR)"
 CREATE_OR_REPLACE_OBJECTS = (
     r"(?:TABLE|VIEW|FUNCTION|STAGE|TASK|PIPE|STREAM|WAREHOUSE|SEQUENCE|PROCEDURE|DICTIONARY"
@@ -79,6 +85,136 @@ def _standardize_sql(sql: str) -> str:
     return sql.strip()
 
 
+_QUOTE_CHARS = ("'", '"', "`")
+_DOLLAR_QUOTE_RE = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*)?\$")
+
+
+def _skip_quoted(sql: str, start: int) -> int | None:
+    """Return the index just past the quoted token starting at `start`, or None if unterminated."""
+    quote = sql[start]
+    index = start + 1
+    length = len(sql)
+    while index < length:
+        char = sql[index]
+        if char == "\\" and quote == "'":
+            index += 2
+            continue
+        if char == quote:
+            # Doubled quotes are escapes inside the literal.
+            if index + 1 < length and sql[index + 1] == quote:
+                index += 2
+                continue
+            return index + 1
+        index += 1
+    return None
+
+
+def _split_sql_statements(sql: str) -> list[str] | None:
+    """Split SQL text into statements on top-level semicolons.
+
+    String literals, quoted identifiers, line/block comments and dollar-quoted
+    bodies ($$ ... $$) are skipped so a semicolon inside them never starts a new
+    statement. Returns None when the input cannot be tokenized unambiguously
+    (unterminated quote or block comment); callers must treat that as a denial.
+    """
+    statements: list[str] = []
+    current: list[str] = []
+    index = 0
+    length = len(sql)
+
+    while index < length:
+        char = sql[index]
+
+        if char in _QUOTE_CHARS:
+            end = _skip_quoted(sql, index)
+            if end is None:
+                return None
+            current.append(sql[index:end])
+            index = end
+            continue
+
+        if char == "$":
+            dollar_match = _DOLLAR_QUOTE_RE.match(sql, index)
+            if dollar_match:
+                tag = dollar_match.group(0)
+                end = sql.find(tag, dollar_match.end())
+                if end == -1:
+                    return None
+                end += len(tag)
+                current.append(sql[index:end])
+                index = end
+                continue
+
+        if sql.startswith("--", index):
+            # Line comment: skip to the end of the line, newline stays in the statement.
+            end = sql.find("\n", index)
+            index = length if end == -1 else end
+            continue
+
+        if sql.startswith("/*", index):
+            end = sql.find("*/", index + 2)
+            if end == -1:
+                return None
+            end += 2
+            current.append(sql[index:end])
+            index = end
+            continue
+
+        if char == ";":
+            statements.append("".join(current))
+            current = []
+            index += 1
+            continue
+
+        current.append(char)
+        index += 1
+
+    statements.append("".join(current))
+    return [statement.strip() for statement in statements if statement.strip()]
+
+
+def has_top_level_separator(sql: str) -> bool:
+    """Return True when `sql` contains a ``;`` outside literals and comments.
+
+    Tool arguments that are interpolated as a SQL *expression* (the SHOW
+    ``filter``) may legitimately contain ``;``, ``--`` or ``/*`` inside a string
+    literal, so callers cannot just search the raw text. Unterminated literals or
+    comments count as a separator (fail closed).
+    """
+    index = 0
+    length = len(sql)
+    while index < length:
+        char = sql[index]
+        if char in _QUOTE_CHARS:
+            end = _skip_quoted(sql, index)
+            if end is None:
+                return True
+            index = end
+            continue
+        if char == "$":
+            dollar_match = _DOLLAR_QUOTE_RE.match(sql, index)
+            if dollar_match:
+                end = sql.find(dollar_match.group(0), dollar_match.end())
+                if end == -1:
+                    return True
+                index = end + len(dollar_match.group(0))
+                continue
+        if sql.startswith("--", index):
+            end = sql.find("\n", index)
+            index = length if end == -1 else end
+            continue
+        if sql.startswith("/*", index):
+            end = sql.find("*/", index + 2)
+            if end == -1:
+                return True
+            index = end + 2
+            continue
+        if char == ";":
+            return True
+        index += 1
+    return False
+
+
 def _extract_identifier(identifier: str, session_prefix: str) -> tuple[str, bool]:
     """Extract identifier and check if it's sandbox.
 
@@ -95,9 +231,31 @@ def _extract_identifier(identifier: str, session_prefix: str) -> tuple[str, bool
     return identifier, identifier.lower().startswith(session_prefix.lower())
 
 
+# CTE heads: `WITH [RECURSIVE] name [ (columns) ] AS (` and `, name [ (columns) ] AS (`.
+_CTE_HEAD_RE = re.compile(
+    r"(?:\bWITH\s+(?:RECURSIVE\s+)?|,\s*)([`\"]?\w+[`\"]?)\s*(?:\([^()]*\)\s*)?AS\s*\(",
+    re.IGNORECASE,
+)
+
+
+def _extract_cte_names(sql: str) -> set[str]:
+    """Collect the names defined by WITH clauses.
+
+    A CTE name is a local alias, not an external object reference; without this
+    ``WITH cte AS (SELECT 1) INSERT INTO sandbox.t SELECT * FROM cte`` would be
+    rejected because ``cte`` does not carry the sandbox prefix.
+    """
+    return {match.group(1).strip('`"').lower() for match in _CTE_HEAD_RE.finditer(sql)}
+
+
 def _contains_non_sandbox_reference(sql: str, session_prefix: str) -> bool:
-    """Check if SQL contains FROM/JOIN/INTO references to non-sandbox objects."""
+    """Check if SQL contains FROM/JOIN/INTO references to non-sandbox objects.
+
+    CTE names are skipped (they are aliases), while references inside the CTE
+    bodies are still inspected because the whole statement text is scanned.
+    """
     sql_clean = _normalize_sql(sql)
+    cte_names = _extract_cte_names(sql_clean)
 
     # Support db.table format
     ref_patterns = [
@@ -111,6 +269,8 @@ def _contains_non_sandbox_reference(sql: str, session_prefix: str) -> bool:
         for match in re.finditer(pattern, sql_clean, re.IGNORECASE):
             ref = match.group(1)
             if ref.upper() in ("SELECT", "VALUES", "USING"):
+                continue
+            if ref.strip("`'\"").lower() in cte_names:
                 continue
             _, is_sandbox = _extract_identifier(ref, session_prefix)
             if not is_sandbox:
@@ -140,14 +300,9 @@ def _check_create_or_replace(sql: str, session_prefix: str) -> SafetyResult | No
     name, is_sandbox = _extract_identifier(obj_name, session_prefix)
     if is_sandbox:
         if obj_type in ("TASK", "PIPE") or "DYNAMIC TABLE" in obj_type:
-            as_match = re.search(r"\bAS\s+(.+)$", sql, re.IGNORECASE | re.DOTALL)
-            if as_match:
-                nested_sql = as_match.group(1).strip()
-                if _contains_non_sandbox_reference(nested_sql, session_prefix):
-                    return SafetyResult(
-                        allowed=False,
-                        reason=f"CREATE OR REPLACE {obj_type} blocked: Referenced object in nested SQL must start with {session_prefix}",
-                    )
+            nested_denial = _check_nested_body(sql, f"CREATE OR REPLACE {obj_type}", session_prefix)
+            if nested_denial is not None:
+                return nested_denial
         if obj_type == "STREAM":
             on_table_match = re.search(
                 rf"\bON\s+TABLE\s+({IDENTIFIER_PATTERN})",
@@ -189,20 +344,144 @@ def _check_replace_into(sql: str, session_prefix: str) -> SafetyResult | None:
     )
 
 
+_STATEMENT_VERBS = frozenset(
+    {
+        "ALTER",
+        "ANALYZE",
+        "BEGIN",
+        "CALL",
+        "COMMIT",
+        "COPY",
+        "CREATE",
+        "DELETE",
+        "DESC",
+        "DESCRIBE",
+        "DROP",
+        "EXPLAIN",
+        "GRANT",
+        "INSERT",
+        "LIST",
+        "MERGE",
+        "OPTIMIZE",
+        "PRAGMA",
+        "REMOVE",
+        "REPLACE",
+        "REVOKE",
+        "ROLLBACK",
+        "SELECT",
+        "SET",
+        "SHOW",
+        "TRUNCATE",
+        "UNDROP",
+        "UPDATE",
+        "USE",
+        "VACUUM",
+    }
+)
+# Databend grammar: EXPLAIN ~ ( explain_options | explain_verbose_alias )?
+#   ~ ( AST | SYNTAX | PIPELINE | JOIN | GRAPH | FRAGMENTS | RAW | OPTIMIZED
+#       | MEMO | DECORRELATED | PERF )? ~ statement
+# The option prefix only describes the plan output; what the policy cares about
+# is the statement it wraps, so the prefix is skipped and the wrapped statement
+# must still be read-only.
+_EXPLAIN_OPTION_KEYWORDS = (
+    "ANALYZE",
+    "AST",
+    "SYNTAX",
+    "GRAPH",
+    "PIPELINE",
+    "JOIN",
+    "FRAGMENTS",
+    "RAW",
+    "OPTIMIZED",
+    "MEMO",
+    "DECORRELATED",
+    "PERF",
+    "VERBOSE",
+    # Accepted historically; harmless synonyms for the plan format.
+    "TREE",
+    "JSON",
+    "FORMAT",
+)
+_EXPLAIN_OPTION_RE = re.compile(rf"^(?:{'|'.join(_EXPLAIN_OPTION_KEYWORDS)})\b\s*")
+_CTE_NAME_RE = re.compile(r"\s*(?:\([^)]*\)\s*)?AS\s*\(", re.IGNORECASE)
+
+
+def _first_top_level_verb(sql: str, skip_cte_names: bool = False) -> str | None:
+    """Return the first statement verb at parenthesis depth 0, or None.
+
+    With ``skip_cte_names`` tokens followed by ``AS (`` (i.e. CTE names) are
+    skipped, so ``WITH cte AS (...) DELETE FROM t`` yields ``DELETE``.
+    """
+    depth = 0
+    index = 0
+    length = len(sql)
+    while index < length:
+        char = sql[index]
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+        elif depth == 0 and (char.isalpha() or char == "_"):
+            end = index + 1
+            while end < length and (sql[end].isalnum() or sql[end] == "_"):
+                end += 1
+            if skip_cte_names and _CTE_NAME_RE.match(sql, end):
+                index = end
+                continue
+            word = sql[index:end].upper()
+            if word in _STATEMENT_VERBS:
+                return word
+            index = end
+            continue
+        index += 1
+    return None
+
+
 def _check_read_only(sql: str, session_prefix: str) -> SafetyResult | None:
-    """Rule: Allow read-only queries on ANY object."""
-    patterns = [
-        r"^\s*SELECT\b",
-        r"^\s*WITH\b.*\bSELECT\b",
-        r"^\s*SHOW\b",
-        r"^\s*DESCRIBE\b",
-        r"^\s*DESC\b",
-        r"^\s*EXPLAIN\b",
-        r"^\s*LIST\s+@",
-    ]
+    """Rule: Allow read-only queries on ANY object.
+
+    The read prefix must describe the *whole* statement: ``EXPLAIN ANALYZE
+    DELETE ...`` and ``WITH ... DELETE ...`` are not read-only and fall through
+    to the write rules below.
+    """
     sql_upper = sql.strip().upper()
-    for pattern in patterns:
-        if re.match(pattern, sql_upper, re.DOTALL):
+
+    if re.match(r"^EXPLAIN\b", sql_upper):
+        remainder = sql_upper[len("EXPLAIN") :].lstrip()
+        while remainder:
+            # Parenthesised option list: EXPLAIN(LOGICAL), EXPLAIN(VERBOSE, OPTIMIZED)
+            if remainder.startswith("("):
+                depth = 0
+                end = -1
+                for position, char in enumerate(remainder):
+                    if char == "(":
+                        depth += 1
+                    elif char == ")":
+                        depth -= 1
+                        if depth == 0:
+                            end = position
+                            break
+                if end == -1:
+                    return None
+                remainder = remainder[end + 1 :].lstrip()
+                continue
+            option = _EXPLAIN_OPTION_RE.match(remainder)
+            if not option:
+                break
+            remainder = remainder[option.end() :].lstrip()
+        if not remainder:
+            return None
+        return _check_read_only(remainder, session_prefix)
+
+    if re.match(r"^SELECT\b", sql_upper):
+        return SafetyResult(allowed=True)
+    if re.match(r"^(?:SHOW|DESCRIBE|DESC)\b", sql_upper):
+        return SafetyResult(allowed=True)
+    if re.match(r"^LIST\s+@", sql_upper):
+        return SafetyResult(allowed=True)
+    if re.match(r"^WITH\b", sql_upper):
+        if _first_top_level_verb(sql_upper[len("WITH") :], skip_cte_names=True) == "SELECT":
             return SafetyResult(allowed=True)
     return None
 
@@ -212,7 +491,7 @@ def _check_create_drop(sql: str, session_prefix: str) -> SafetyResult | None:
     # Support db.table format
     match = re.search(
         rf"\b(CREATE|DROP)\s+({CREATE_DROP_OBJECTS})\s+"
-        rf"(?:IF\s+(?:NOT\s+)?EXISTS\s+)?({IDENTIFIER_PATTERN})",
+        rf"(?:IF\s+(?:NOT\s+)?EXISTS\s+)?({IDENTIFIER_LIST_PATTERN})",
         sql,
         re.IGNORECASE,
     )
@@ -220,36 +499,28 @@ def _check_create_drop(sql: str, session_prefix: str) -> SafetyResult | None:
         return None
 
     obj_type = match.group(2).upper()
-    obj_name = match.group(3)
+    obj_names = match.group(3)
 
-    # Check object name has sandbox prefix
-    name, is_sandbox = _extract_identifier(obj_name, session_prefix)
-    if not is_sandbox:
-        return SafetyResult(
-            allowed=False,
-            reason=f"Operation blocked: '{name}' must start with {session_prefix}",
-        )
+    # DROP accepts a comma-separated target list, so every target is checked -
+    # approving the statement on the strength of its first (sandbox) name would
+    # let "DROP TABLE sandbox.t, production.users" through.
+    targets = re.findall(IDENTIFIER_PATTERN, obj_names, re.IGNORECASE) or [obj_names]
+    for obj_name in targets:
+        name, is_sandbox = _extract_identifier(obj_name, session_prefix)
+        if not is_sandbox:
+            return SafetyResult(
+                allowed=False,
+                reason=f"Operation blocked: '{name}' must start with {session_prefix}",
+            )
 
-    # For TASK/PIPE, check nested SQL references
-    if obj_type in ("TASK", "PIPE"):
-        as_match = re.search(r"\bAS\s+(.+)$", sql, re.IGNORECASE | re.DOTALL)
-        if as_match:
-            nested_sql = as_match.group(1).strip()
-            if _contains_non_sandbox_reference(nested_sql, session_prefix):
-                return SafetyResult(
-                    allowed=False,
-                    reason=f"CREATE {obj_type} blocked: Referenced object in nested SQL must start with {session_prefix}",
-                )
-
-    if "DYNAMIC TABLE" in obj_type:
-        as_match = re.search(r"\bAS\s+(.+)$", sql, re.IGNORECASE | re.DOTALL)
-        if as_match:
-            nested_sql = as_match.group(1).strip()
-            if _contains_non_sandbox_reference(nested_sql, session_prefix):
-                return SafetyResult(
-                    allowed=False,
-                    reason=f"CREATE {obj_type} blocked: Referenced object in nested SQL must start with {session_prefix}",
-                )
+    # For TASK/PIPE/DYNAMIC TABLE, the deferred body must itself be allowed:
+    # the body runs later with the DSN principal's rights, so only checking its
+    # FROM/JOIN references would let "CREATE TASK t AS DROP TABLE production.x"
+    # (or a GRANT) through.
+    if obj_type in ("TASK", "PIPE") or "DYNAMIC TABLE" in obj_type:
+        nested_denial = _check_nested_body(sql, f"CREATE {obj_type}", session_prefix)
+        if nested_denial is not None:
+            return nested_denial
 
     # For STREAM, check ON TABLE reference
     if obj_type == "STREAM":
@@ -306,14 +577,9 @@ def _check_index(sql: str, session_prefix: str) -> SafetyResult | None:
                     reason=f"CREATE INDEX blocked: Referenced object '{name}' must start with {session_prefix}",
                 )
 
-        as_match = re.search(r"\bAS\s+(.+)$", sql, re.IGNORECASE | re.DOTALL)
-        if as_match:
-            nested_sql = as_match.group(1).strip()
-            if _contains_non_sandbox_reference(nested_sql, session_prefix):
-                return SafetyResult(
-                    allowed=False,
-                    reason=f"CREATE INDEX blocked: Referenced object in nested SQL must start with {session_prefix}",
-                )
+        nested_denial = _check_nested_body(sql, "CREATE INDEX", session_prefix)
+        if nested_denial is not None:
+            return nested_denial
 
         return SafetyResult(allowed=True)
 
@@ -396,6 +662,17 @@ def _check_tag_actions(sql: str, session_prefix: str) -> SafetyResult | None:
     return SafetyResult(allowed=True)
 
 
+def _is_qualified_name(name: str) -> bool:
+    """True when the identifier text is database-qualified (``db.table``)."""
+    name = name.strip()
+    if not name:
+        return False
+    if name[0] in _QUOTE_CHARS:
+        # A single quoted identifier may contain a dot but is not qualified.
+        return False
+    return "." in name
+
+
 def _check_alter(sql: str, session_prefix: str) -> SafetyResult | None:
     """Rule: ALTER operations must be on sandbox objects."""
     match = re.search(
@@ -406,14 +683,48 @@ def _check_alter(sql: str, session_prefix: str) -> SafetyResult | None:
     if not match:
         return None
 
+    obj_type = match.group(1).upper()
     obj_name = match.group(2)
+    source_is_qualified = _is_qualified_name(obj_name)
+
     name, is_sandbox = _extract_identifier(obj_name, session_prefix)
-    if is_sandbox:
-        return SafetyResult(allowed=True)
-    return SafetyResult(
-        allowed=False,
-        reason=f"ALTER blocked: '{name}' must start with {session_prefix}",
-    )
+    if not is_sandbox:
+        return SafetyResult(
+            allowed=False,
+            reason=f"ALTER blocked: '{name}' must start with {session_prefix}",
+        )
+
+    # RENAME TO / SWAP WITH move or exchange objects, so their destination must
+    # stay inside the sandbox: "ALTER TABLE sandbox.t RENAME TO production.pwned"
+    # and "ALTER TABLE sandbox.t SWAP WITH production.users" write outside it.
+    for keyword in ("RENAME TO", "SWAP WITH"):
+        for dest_match in re.finditer(rf"\b{keyword}\s+({IDENTIFIER_PATTERN})", sql, re.IGNORECASE):
+            destination = dest_match.group(1)
+            dest_name, dest_is_sandbox = _extract_identifier(destination, session_prefix)
+            if _is_qualified_name(destination):
+                if not dest_is_sandbox:
+                    return SafetyResult(
+                        allowed=False,
+                        reason=f"ALTER {keyword} blocked: '{dest_name}' must start with {session_prefix}",
+                    )
+                continue
+            # Databend only accepts a bare destination ("RENAME TO t2"), which
+            # stays in the source object's database. That is safe when the
+            # destination already carries the prefix, or when the source is
+            # database-qualified so its database is the known sandbox one.
+            if dest_is_sandbox:
+                continue
+            if obj_type in ("TABLE", "VIEW") and source_is_qualified:
+                continue
+            return SafetyResult(
+                allowed=False,
+                reason=(
+                    f"ALTER {keyword} blocked: '{dest_name}' must start with {session_prefix} "
+                    f"(or use a database-qualified source so the destination stays in the sandbox database)"
+                ),
+            )
+
+    return SafetyResult(allowed=True)
 
 
 def _check_optimize_vacuum(sql: str, session_prefix: str) -> SafetyResult | None:
@@ -436,39 +747,154 @@ def _check_optimize_vacuum(sql: str, session_prefix: str) -> SafetyResult | None
     )
 
 
+_GRANT_TARGET_KEYWORDS = frozenset(
+    {
+        "ACCESS",
+        "ALL",
+        "CATALOG",
+        "CATALOGS",
+        "CONNECTION",
+        "CONNECTIONS",
+        "DATABASE",
+        "DATABASES",
+        "FILE",
+        "FORMAT",
+        "FORMATS",
+        "FUTURE",
+        "GROUP",
+        "GROUPS",
+        "IN",
+        "INTEGRATION",
+        "INTEGRATIONS",
+        "MASKING",
+        "NETWORK",
+        "NOTIFICATION",
+        "OBJECTS",
+        "ON",
+        "PASSWORD",
+        "POLICIES",
+        "POLICY",
+        "PRIVILEGES",
+        "PROCEDURE",
+        "PROCEDURES",
+        "ROW",
+        "SCHEMA",
+        "SCHEMAS",
+        "SEQUENCE",
+        "SEQUENCES",
+        "STAGE",
+        "STAGES",
+        "TABLE",
+        "TABLES",
+        "TAG",
+        "TAGS",
+        "UDF",
+        "UDFS",
+        "VIEW",
+        "VIEWS",
+        "WAREHOUSE",
+        "WAREHOUSES",
+        "WORKLOAD",
+    }
+)
+
+
+def _grant_target_identifiers(target: str) -> list[str] | None:
+    """Collect the object identifiers named in a GRANT/REVOKE ``ON`` clause.
+
+    Object-type keywords are skipped; quoted names are always identifiers, so a
+    database literally called ``"tables"`` is still checked. Returns None when
+    the clause cannot be tokenized.
+    """
+    identifiers: list[str] = []
+    index = 0
+    length = len(target)
+    while index < length:
+        char = target[index]
+        if char.isspace() or char == ",":
+            index += 1
+            continue
+        if char in _QUOTE_CHARS:
+            end = _skip_quoted(target, index)
+            if end is None:
+                return None
+            identifiers.append(target[index:end])
+            index = end
+            continue
+        if char.isalpha() or char == "_":
+            start = index
+            end = index
+            while end < length and (target[end].isalnum() or target[end] in "_$"):
+                end += 1
+            token = target[start:end]
+            if end < length and target[end] == "." and end + 1 < length and (target[end + 1].isalnum() or target[end + 1] in "_$"):
+                tail = _read_qualified_tail(target, end)
+                identifiers.append(token + tail)
+                index = end + len(tail)
+            else:
+                if token.upper() not in _GRANT_TARGET_KEYWORDS:
+                    identifiers.append(token)
+                index = end
+            continue
+        index += 1
+    return identifiers
+
+
+def _read_qualified_tail(target: str, index: int) -> str:
+    """Read the ``.name`` tail of a qualified identifier starting at `index`."""
+    tail = ""
+    length = len(target)
+    while index < length and target[index] == ".":
+        tail += "."
+        index += 1
+        while index < length and (target[index].isalnum() or target[index] in "_$"):
+            tail += target[index]
+            index += 1
+    return tail
+
+
 def _check_grant_revoke(sql: str, session_prefix: str) -> SafetyResult | None:
     """Rule: GRANT/REVOKE - all involved objects must be sandbox."""
     if not re.search(r"\b(GRANT|REVOKE)\b", sql, re.IGNORECASE):
         return None
 
-    grant_identifiers = []
+    grant_identifiers: list[str] = []
 
-    # Extract ON DATABASE/TABLE patterns - support db.table
-    for pattern in [
-        rf"\bON\s+DATABASE\s+({IDENTIFIER_PATTERN})",
-        rf"\bON\s+WAREHOUSE\s+({IDENTIFIER_PATTERN})",
-        rf"\bON\s+TABLE\s+({IDENTIFIER_PATTERN})",
-        rf"\bON\s+STAGE\s+({IDENTIFIER_PATTERN})",
-        rf"\bON\s+UDF\s+({IDENTIFIER_PATTERN})",
-        rf"\bON\s+CONNECTION\s+({IDENTIFIER_PATTERN})",
-        rf"\bON\s+SEQUENCE\s+({IDENTIFIER_PATTERN})",
-        rf"\bON\s+PROCEDURE\s+({IDENTIFIER_PATTERN})",
-        rf"\bON\s+MASKING\s+POLICY\s+({IDENTIFIER_PATTERN})",
-        rf"\bON\s+ROW\s+ACCESS\s+POLICY\s+({IDENTIFIER_PATTERN})",
-        r'\bON\s+([`\'"]?\w+[`\'"]?)\.\\*',
-    ]:
-        match = re.search(pattern, sql, re.IGNORECASE)
-        if match:
-            grant_identifiers.append(match.group(1))
+    on_clause = re.search(r"\bON\b(.*?)(?:\bTO\b|\bFROM\b|$)", sql, re.IGNORECASE | re.DOTALL)
+    if on_clause:
+        target = on_clause.group(1)
+        # The global wildcard (* / *.*) carries no identifier for the checks
+        # below to inspect and would grant authority over the whole warehouse,
+        # so it is rejected outright. <db>.* is inspected through its database.
+        if "*" in target and not re.fullmatch(r"\s*[`\'\"]?\w+[`\'\"]?\s*\.\s*\*\s*", target):
+            return SafetyResult(
+                allowed=False,
+                reason=f"GRANT/REVOKE blocked: global wildcard target '{target.strip()}' is not allowed",
+            )
+        on_identifiers = _grant_target_identifiers(target)
+        if on_identifiers is None:
+            return SafetyResult(
+                allowed=False,
+                reason="GRANT/REVOKE blocked: ON clause could not be tokenized safely",
+            )
+        grant_identifiers.extend(on_identifiers)
+
+    # A wildcard outside an object reference ("TO *", "ON *") names no
+    # identifier this rule can inspect, so it is rejected.
+    for star in re.finditer(r"\*", sql):
+        if not re.search(r"[`'\"]?\w+[`'\"]?\s*\.\s*$", sql[: star.start()]):
+            return SafetyResult(
+                allowed=False,
+                reason="GRANT/REVOKE blocked: wildcard is only supported as '<sandbox_object>.*'",
+            )
 
     # Extract ROLE/TO/FROM patterns
     for pattern in [
-        r'\bROLE\s+([`\'"]?\w+[`\'"]?)',
-        r'\bTO\s+([`\'"]?\w+[`\'"]?)',
-        r'\bFROM\s+([`\'"]?\w+[`\'"]?)',
+        r"\bROLE\s+([`\'\"]?\w+[`\'\"]?)",
+        r"\bTO\s+([`\'\"]?\w+[`\'\"]?)",
+        r"\bFROM\s+([`\'\"]?\w+[`\'\"]?)",
     ]:
-        match = re.search(pattern, sql, re.IGNORECASE)
-        if match:
+        for match in re.finditer(pattern, sql, re.IGNORECASE):
             grant_identifiers.append(match.group(1))
 
     # Check all extracted identifiers
@@ -488,32 +914,43 @@ def _check_grant_revoke(sql: str, session_prefix: str) -> SafetyResult | None:
 def _check_dml(sql: str, session_prefix: str) -> SafetyResult | None:
     """Rule: DML operations must be on sandbox objects."""
     # Support db.table format
+    # TRUNCATE accepts a comma-separated target list, every other DML statement
+    # here has a single target.
     dml_patterns = [
-        (rf"\bINSERT\s+(?:INTO\s+)?({IDENTIFIER_PATTERN})", "INSERT"),
-        (rf"\bUPDATE\s+({IDENTIFIER_PATTERN})", "UPDATE"),
-        (rf"\bDELETE\s+FROM\s+({IDENTIFIER_PATTERN})", "DELETE"),
-        (rf"\bTRUNCATE\s+(?:TABLE\s+)?({IDENTIFIER_PATTERN})", "TRUNCATE"),
-        (rf"\bCOPY\s+INTO\s+({IDENTIFIER_PATTERN})", "COPY INTO"),
-        (rf"\bMERGE\s+INTO\s+({IDENTIFIER_PATTERN})", "MERGE INTO"),
+        (rf"\bINSERT\s+(?:INTO\s+)?({IDENTIFIER_PATTERN})", "INSERT", False),
+        (rf"\bUPDATE\s+({IDENTIFIER_PATTERN})", "UPDATE", False),
+        (rf"\bDELETE\s+FROM\s+({IDENTIFIER_PATTERN})", "DELETE", False),
+        (rf"\bTRUNCATE\s+(?:TABLE\s+)?({IDENTIFIER_LIST_PATTERN})", "TRUNCATE", True),
+        (rf"\bCOPY\s+INTO\s+({IDENTIFIER_PATTERN})", "COPY INTO", False),
+        (rf"\bMERGE\s+INTO\s+({IDENTIFIER_PATTERN})", "MERGE INTO", False),
     ]
 
-    for pattern, op_name in dml_patterns:
+    for pattern, op_name, multiple_targets in dml_patterns:
         match = re.search(pattern, sql, re.IGNORECASE)
-        if match:
-            obj_name = match.group(1)
+        if not match:
+            continue
+
+        obj_names = match.group(1)
+        if multiple_targets:
+            targets = re.findall(IDENTIFIER_PATTERN, obj_names, re.IGNORECASE) or [obj_names]
+        else:
+            targets = [obj_names]
+
+        for obj_name in targets:
             name, is_sandbox = _extract_identifier(obj_name, session_prefix)
-            if is_sandbox:
-                # Check if SQL contains non-sandbox references in FROM/JOIN
-                if _contains_non_sandbox_reference(sql, session_prefix):
-                    return SafetyResult(
-                        allowed=False,
-                        reason=f"{op_name} blocked: SQL references non-sandbox objects. All objects must start with {session_prefix}",
-                    )
-                return SafetyResult(allowed=True)
+            if not is_sandbox:
+                return SafetyResult(
+                    allowed=False,
+                    reason=f"{op_name} blocked: '{name}' must start with {session_prefix}",
+                )
+
+        # Check if SQL contains non-sandbox references in FROM/JOIN
+        if _contains_non_sandbox_reference(sql, session_prefix):
             return SafetyResult(
                 allowed=False,
-                reason=f"{op_name} blocked: '{name}' must start with {session_prefix}",
+                reason=f"{op_name} blocked: SQL references non-sandbox objects. All objects must start with {session_prefix}",
             )
+        return SafetyResult(allowed=True)
     return None
 
 
@@ -556,8 +993,12 @@ def check_sql_safety(sql: str) -> SafetyResult:
     """
     Check if SQL is safe - STRICT whitelist approach.
 
-    Rules are checked in order. First matching rule determines the result.
-    If no rule matches, operation is REJECTED by default.
+    Exactly one statement is accepted per call. Rules are checked in order and
+    the first matching rule determines the result; if no rule matches, the
+    operation is REJECTED by default. Because the caller forwards the original
+    string to the driver, the gate decides on the same statement text that will
+    be executed - multiple statements separated by ``;`` are never approved on
+    the strength of the first one.
 
     Args:
         sql: SQL query string
@@ -565,6 +1006,24 @@ def check_sql_safety(sql: str) -> SafetyResult:
     Returns:
         SafetyResult with allowed status and reason if blocked
     """
+    statements = _split_sql_statements(sql)
+    if statements is None:
+        return SafetyResult(
+            allowed=False,
+            reason="SQL could not be tokenized safely (unterminated string, quoted identifier or comment)",
+        )
+    if not statements:
+        return SafetyResult(allowed=False, reason="Empty SQL statement")
+    if len(statements) > 1:
+        return SafetyResult(
+            allowed=False,
+            reason=(f"Multiple SQL statements are not allowed in one call (found {len(statements)}). Submit each statement separately."),
+        )
+    return _check_single_statement(statements[0])
+
+
+def _check_single_statement(sql: str) -> SafetyResult:
+    """Run the rule chain over one statement."""
     # Standardize SQL format first
     sql_std = _standardize_sql(sql)
     session_prefix = get_session_prefix()
@@ -580,3 +1039,49 @@ def check_sql_safety(sql: str) -> SafetyResult:
         allowed=False,
         reason=f"Operation not allowed. Only read operations and writes to {session_prefix}* objects are permitted.",
     )
+
+
+_NESTED_STATE = threading.local()
+
+
+def _check_nested_sql(sql: str) -> SafetyResult:
+    """Validate a deferred statement body with the full rule chain."""
+    depth = getattr(_NESTED_STATE, "depth", 0)
+    if depth >= MAX_NESTED_SQL_DEPTH:
+        return SafetyResult(
+            allowed=False,
+            reason=f"Nested SQL is nested deeper than {MAX_NESTED_SQL_DEPTH} levels",
+        )
+    _NESTED_STATE.depth = depth + 1
+    try:
+        return check_sql_safety(sql)
+    finally:
+        _NESTED_STATE.depth = depth
+
+
+def _check_nested_body(sql: str, object_label: str, session_prefix: str) -> SafetyResult | None:
+    """Validate the ``AS <body>`` statement of CREATE ... AS constructs.
+
+    Returns a denial when the body references non-sandbox objects or is not
+    itself allowed by the rule chain (e.g. ``CREATE TASK t AS DROP TABLE prod``).
+    """
+    as_match = re.search(r"\bAS\s+(.+)$", sql, re.IGNORECASE | re.DOTALL)
+    if not as_match:
+        return None
+    nested_sql = as_match.group(1).strip()
+    if not nested_sql:
+        return None
+
+    if _contains_non_sandbox_reference(nested_sql, session_prefix):
+        return SafetyResult(
+            allowed=False,
+            reason=f"{object_label} blocked: Referenced object in nested SQL must start with {session_prefix}",
+        )
+
+    nested_result = _check_nested_sql(nested_sql)
+    if not nested_result.allowed:
+        return SafetyResult(
+            allowed=False,
+            reason=f"{object_label} blocked: nested SQL is not allowed ({nested_result.reason})",
+        )
+    return None

@@ -711,3 +711,399 @@ class TestSQLStandardization:
         sql = "INSERT/*comment*/INTO production.users VALUES (1)"
         result = check_sql_safety(sql)
         assert result.allowed is False
+
+
+class TestStatementBoundaries:
+    """A statement must not ride on the approval of another one."""
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT 1; DROP DATABASE production",
+            "SHOW DATABASES; DROP TABLE production.users",
+            "DESC mydb.t; DROP DATABASE production",
+            "SELECT 1; SELECT 2",
+        ],
+    )
+    def test_stacked_statements_blocked(self, sql):
+        result = check_sql_safety(sql)
+        assert result.allowed is False
+        assert "Multiple SQL statements" in result.reason
+
+    def test_stacked_statement_after_sandbox_write_blocked(self):
+        sql = f"INSERT INTO {get_session_prefix()}db.t VALUES (1); DROP DATABASE production"
+        result = check_sql_safety(sql)
+        assert result.allowed is False
+        assert "Multiple SQL statements" in result.reason
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT * FROM production.users;",
+            "  SELECT 1 ;  ",
+            f"CREATE OR REPLACE PROCEDURE {get_session_prefix()}proc AS $$ SELECT 1; SELECT 2 $$",
+        ],
+    )
+    def test_single_statement_with_trailing_separator_allowed(self, sql):
+        assert check_sql_safety(sql).allowed is True
+
+    def test_semicolon_inside_string_is_not_a_separator(self):
+        assert check_sql_safety("SELECT * FROM t WHERE c = 'a;b'").allowed is True
+        assert check_sql_safety("SELECT * FROM t WHERE c = 'it''s; fine'").allowed is True
+
+    def test_semicolon_inside_comment_is_not_a_separator(self):
+        assert check_sql_safety("SELECT 1 -- ; DROP DATABASE production").allowed is True
+        assert check_sql_safety("SELECT 1 /* ; DROP DATABASE production */").allowed is True
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT 'unterminated",
+            "SELECT 1 /* unterminated",
+            "SELECT `unterminated",
+        ],
+    )
+    def test_untokenizable_sql_blocked(self, sql):
+        result = check_sql_safety(sql)
+        assert result.allowed is False
+        assert "tokenized" in result.reason
+
+
+class TestReadOnlyPrefixNarrowing:
+    """The read-only rule must describe the whole statement, not just a prefix."""
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "EXPLAIN ANALYZE DELETE FROM production.users",
+            "EXPLAIN ANALYZE INSERT INTO production.users VALUES (1)",
+            "EXPLAIN ANALYZE UPDATE production.users SET admin = true",
+            "EXPLAIN DROP DATABASE production",
+            "EXPLAIN CREATE USER evil IDENTIFIED BY 'x'",
+        ],
+    )
+    def test_explain_of_write_blocked(self, sql):
+        assert check_sql_safety(sql).allowed is False
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "EXPLAIN SELECT * FROM production.users",
+            "EXPLAIN ANALYZE SELECT * FROM production.users",
+            "EXPLAIN AST SELECT 1",
+            "EXPLAIN SYNTAX SELECT 1",
+        ],
+    )
+    def test_explain_of_read_allowed(self, sql):
+        assert check_sql_safety(sql).allowed is True
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "WITH cte AS (SELECT 1) DELETE FROM production.users",
+            "WITH cte AS (SELECT 1) UPDATE production.users SET admin = true",
+            "WITH cte AS (SELECT 1) DROP DATABASE production",
+            "WITH RECURSIVE cte AS (SELECT 1) DELETE FROM production.users",
+        ],
+    )
+    def test_cte_write_on_non_sandbox_blocked(self, sql):
+        assert check_sql_safety(sql).allowed is False
+
+    def test_cte_select_allowed(self):
+        assert check_sql_safety("WITH cte AS (SELECT 1) SELECT * FROM cte").allowed is True
+
+    def test_cte_write_on_sandbox_allowed(self):
+        sql = f"WITH cte AS (SELECT 1) DELETE FROM {get_session_prefix()}db.t"
+        assert check_sql_safety(sql).allowed is True
+
+
+class TestGrantWildcard:
+    """A wildcard GRANT target must not slip past the identifier checks."""
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "GRANT ALL PRIVILEGES ON *.* TO mcp_sandbox_evil",
+            "GRANT ALL ON *.* TO mcp_sandbox_evil WITH GRANT OPTION",
+            "GRANT ALL ON *.* TO root",
+            "GRANT SELECT ON DATABASE * TO mcp_sandbox_user",
+            "REVOKE ALL ON *.* FROM mcp_sandbox_user",
+        ],
+    )
+    def test_global_wildcard_blocked(self, sql):
+        result = check_sql_safety(sql)
+        assert result.allowed is False
+
+    def test_global_wildcard_blocked_for_sandbox_grantee(self):
+        """The sandbox prefix on the grantee must not carry a global grant."""
+        prefix = get_session_prefix()
+        sql = f"GRANT ALL PRIVILEGES ON *.* TO {prefix}evil"
+        result = check_sql_safety(sql)
+        assert result.allowed is False
+        assert "wildcard" in result.reason
+
+    def test_sandbox_database_wildcard_allowed(self):
+        prefix = get_session_prefix()
+        sql = f"GRANT SELECT ON {prefix}db.* TO {prefix}user"
+        assert check_sql_safety(sql).allowed is True
+
+    def test_non_sandbox_database_wildcard_blocked(self):
+        prefix = get_session_prefix()
+        sql = f"GRANT SELECT ON production.* TO {prefix}user"
+        result = check_sql_safety(sql)
+        assert result.allowed is False
+        assert "production" in result.reason
+
+    def test_non_sandbox_grantee_with_sandbox_target_blocked(self):
+        prefix = get_session_prefix()
+        sql = f"GRANT SELECT ON DATABASE {prefix}db TO root"
+        assert check_sql_safety(sql).allowed is False
+
+
+class TestMultiTargetWriteRules:
+    """Write rules must validate every target, not only the first identifier."""
+
+    @pytest.mark.parametrize(
+        "statement",
+        [
+            "DROP TABLE {p}t, production.users",
+            "DROP TABLE IF EXISTS {p}a, production.users",
+            "DROP VIEW {p}v, production.v2",
+            "DROP USER {p}u, production.u",
+            "TRUNCATE TABLE {p}t, production.events",
+            "TRUNCATE {p}t, production.events",
+        ],
+    )
+    def test_comma_separated_targets_blocked(self, statement):
+        sql = statement.format(p=get_session_prefix())
+        result = check_sql_safety(sql)
+        assert result.allowed is False
+        assert "production" in result.reason
+
+    @pytest.mark.parametrize(
+        "statement",
+        [
+            "DROP TABLE {p}a, {p}b",
+            "TRUNCATE TABLE {p}t, {p}t2",
+        ],
+    )
+    def test_comma_separated_sandbox_targets_allowed(self, statement):
+        sql = statement.format(p=get_session_prefix())
+        assert check_sql_safety(sql).allowed is True
+
+    @pytest.mark.parametrize(
+        "statement",
+        [
+            "ALTER TABLE {p}db.t RENAME TO production.pwned",
+            "ALTER TABLE {p}t SWAP WITH production.users",
+            "ALTER DATABASE {p}db RENAME TO production",
+            "ALTER WAREHOUSE {p}wh RENAME TO prod_wh",
+        ],
+    )
+    def test_alter_destination_blocked(self, statement):
+        sql = statement.format(p=get_session_prefix())
+        result = check_sql_safety(sql)
+        assert result.allowed is False
+        assert "ALTER" in result.reason
+
+    def test_alter_rename_inside_sandbox_allowed(self):
+        prefix = get_session_prefix()
+        sql = f"ALTER TABLE {prefix}db.t RENAME TO {prefix}db.t2"
+        assert check_sql_safety(sql).allowed is True
+
+    def test_alter_rename_column_allowed(self):
+        prefix = get_session_prefix()
+        sql = f"ALTER TABLE {prefix}db.t RENAME COLUMN a TO b"
+        assert check_sql_safety(sql).allowed is True
+
+
+class TestDeferredBodies:
+    """TASK/PIPE/DYNAMIC TABLE bodies are validated by the full rule chain."""
+
+    @pytest.mark.parametrize(
+        "statement",
+        [
+            "CREATE TASK {p}t AS DROP TABLE production.users",
+            "CREATE TASK {p}t AS TRUNCATE TABLE production.events",
+            "CREATE TASK {p}t AS ALTER TABLE production.t DROP COLUMN c",
+            "CREATE TASK {p}t AS CREATE USER hacker IDENTIFIED BY 'x'",
+            "CREATE TASK {p}t AS GRANT ALL ON *.* TO hacker",
+            "CREATE TASK {p}t AS DROP DATABASE production",
+            "CREATE OR REPLACE TASK {p}t AS DROP TABLE production.users",
+            "CREATE PIPE {p}p AS ALTER TABLE production.t DROP COLUMN c",
+            "CREATE DYNAMIC TABLE {p}db.dt AS DROP DATABASE production",
+        ],
+    )
+    def test_non_sandbox_body_blocked(self, statement):
+        sql = statement.format(p=get_session_prefix())
+        result = check_sql_safety(sql)
+        assert result.allowed is False
+
+    @pytest.mark.parametrize(
+        "statement",
+        [
+            "CREATE TASK {p}t AS INSERT INTO {p}db.t VALUES (1)",
+            "CREATE TASK {p}t AS SELECT 1",
+            "CREATE OR REPLACE TASK {p}t AS INSERT INTO {p}db.t VALUES (1)",
+            "CREATE PIPE {p}p AS COPY INTO {p}db.t FROM @stage",
+            "CREATE DYNAMIC TABLE {p}db.dt AS SELECT * FROM {p}db.t",
+        ],
+    )
+    def test_sandbox_body_allowed(self, statement):
+        sql = statement.format(p=get_session_prefix())
+        assert check_sql_safety(sql).allowed is True
+
+    def test_deeply_nested_bodies_blocked(self):
+        prefix = get_session_prefix()
+        sql = ("CREATE TASK " + prefix + "t AS ") * 6 + "SELECT 1"
+        result = check_sql_safety(sql)
+        assert result.allowed is False
+        assert "Nested SQL" in result.reason
+
+
+class TestGrantTargetCoverage:
+    """Every object class in an ON clause is checked, not a fixed list of them."""
+
+    @pytest.mark.parametrize(
+        "statement",
+        [
+            "GRANT SELECT ON VIEW production.v TO {p}user",
+            "GRANT SELECT ON TAG production.tag TO {p}user",
+            "GRANT SELECT ON CATALOG prod_cat TO {p}user",
+            "GRANT SELECT ON FILE FORMAT prod_ff TO {p}user",
+            'GRANT SELECT ON DATABASE "tables" TO {p}user',
+            "GRANT SELECT ON ALL TABLES IN SCHEMA production TO {p}user",
+        ],
+    )
+    def test_any_object_class_checked(self, statement):
+        sql = statement.format(p=get_session_prefix())
+        result = check_sql_safety(sql)
+        assert result.allowed is False
+
+    def test_wildcard_outside_object_reference_blocked(self):
+        prefix = get_session_prefix()
+        sql = f"GRANT SELECT ON DATABASE {prefix}db TO *"
+        result = check_sql_safety(sql)
+        assert result.allowed is False
+        assert "wildcard" in result.reason
+
+    @pytest.mark.parametrize(
+        "statement",
+        [
+            "GRANT SELECT ON DATABASE {p}db TO {p}user",
+            "GRANT SELECT ON TABLE {p}db.t TO {p}user",
+            "GRANT USAGE ON WAREHOUSE {p}wh TO {p}user",
+            "GRANT SELECT ON ALL TABLES IN SCHEMA {p}db TO {p}user",
+            "GRANT ROLE {p}role TO {p}user",
+            "REVOKE SELECT ON DATABASE {p}db FROM {p}user",
+        ],
+    )
+    def test_sandbox_targets_still_allowed(self, statement):
+        sql = statement.format(p=get_session_prefix())
+        assert check_sql_safety(sql).allowed is True
+
+
+class TestExplainVariants:
+    """Valid Databend EXPLAIN variants must stay read-only (compat regression B5)."""
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "EXPLAIN SELECT * FROM production.users",
+            "EXPLAIN ANALYZE SELECT 1",
+            "EXPLAIN AST SELECT 1",
+            "EXPLAIN SYNTAX SELECT 1",
+            "EXPLAIN OPTIMIZED SELECT 1",
+            "EXPLAIN MEMO SELECT 1",
+            "EXPLAIN PERF SELECT 1",
+            "EXPLAIN DECORRELATED SELECT 1",
+            "EXPLAIN(LOGICAL) SELECT 1",
+            "EXPLAIN(VERBOSE, OPTIMIZED) SELECT 1",
+            "EXPLAIN (LOGICAL) SELECT 1",
+        ],
+    )
+    def test_read_explain_variants_allowed(self, sql):
+        assert check_sql_safety(sql).allowed is True
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "EXPLAIN DROP DATABASE production",
+            "EXPLAIN ANALYZE DELETE FROM production.users",
+            "EXPLAIN MEMO DROP TABLE production.users",
+            "EXPLAIN(LOGICAL) CREATE USER evil IDENTIFIED BY 'x'",
+        ],
+    )
+    def test_explain_of_write_still_blocked(self, sql):
+        assert check_sql_safety(sql).allowed is False
+
+
+class TestCteWrites:
+    """CTE names are aliases, not non-sandbox references (compat regression B6)."""
+
+    def test_cte_insert_into_sandbox_allowed(self):
+        prefix = get_session_prefix()
+        sql = f"WITH cte AS (SELECT 1) INSERT INTO {prefix}db.t SELECT * FROM cte"
+        assert check_sql_safety(sql).allowed is True
+
+    def test_cte_update_sandbox_allowed(self):
+        prefix = get_session_prefix()
+        sql = f"WITH cte AS (SELECT 2) UPDATE {prefix}db.t SET a = 2 WHERE a IN (SELECT * FROM cte)"
+        assert check_sql_safety(sql).allowed is True
+
+    def test_cte_delete_sandbox_allowed(self):
+        prefix = get_session_prefix()
+        sql = f"WITH cte AS (SELECT 1) DELETE FROM {prefix}db.t WHERE a IN (SELECT * FROM cte)"
+        assert check_sql_safety(sql).allowed is True
+
+    def test_multiple_ctes_allowed(self):
+        prefix = get_session_prefix()
+        sql = f"WITH a AS (SELECT 1), b AS (SELECT * FROM a) INSERT INTO {prefix}db.t SELECT * FROM b"
+        assert check_sql_safety(sql).allowed is True
+
+    def test_cte_body_reference_to_non_sandbox_still_blocked(self):
+        prefix = get_session_prefix()
+        sql = f"WITH cte AS (SELECT * FROM production.users) INSERT INTO {prefix}db.t SELECT * FROM cte"
+        result = check_sql_safety(sql)
+        assert result.allowed is False
+        assert "non-sandbox" in result.reason
+
+    def test_cte_write_on_non_sandbox_target_still_blocked(self):
+        sql = "WITH cte AS (SELECT 1) INSERT INTO production.users SELECT * FROM cte"
+        assert check_sql_safety(sql).allowed is False
+
+
+class TestAlterRenameDestinations:
+    """Bare RENAME TO / SWAP WITH destinations mean "same database" (compat regression R2)."""
+
+    def test_bare_rename_from_qualified_sandbox_table_allowed(self):
+        prefix = get_session_prefix()
+        sql = f"ALTER TABLE {prefix}db.t RENAME TO t2"
+        assert check_sql_safety(sql).allowed is True
+
+    def test_bare_swap_from_qualified_sandbox_table_allowed(self):
+        prefix = get_session_prefix()
+        sql = f"ALTER TABLE {prefix}db.t SWAP WITH t3"
+        assert check_sql_safety(sql).allowed is True
+
+    def test_bare_rename_from_bare_sandbox_table_blocked(self):
+        # Without a database-qualified source the destination cannot be shown to
+        # stay inside the sandbox database.
+        prefix = get_session_prefix()
+        sql = f"ALTER TABLE {prefix}t RENAME TO t2"
+        assert check_sql_safety(sql).allowed is False
+
+    def test_prefixed_bare_destination_allowed(self):
+        prefix = get_session_prefix()
+        sql = f"ALTER TABLE {prefix}t RENAME TO {prefix}t2"
+        assert check_sql_safety(sql).allowed is True
+
+    def test_qualified_non_sandbox_destination_blocked(self):
+        prefix = get_session_prefix()
+        sql = f"ALTER TABLE {prefix}db.t RENAME TO production.pwned"
+        assert check_sql_safety(sql).allowed is False
+
+    def test_database_rename_to_non_sandbox_blocked(self):
+        prefix = get_session_prefix()
+        sql = f"ALTER DATABASE {prefix}db RENAME TO production"
+        assert check_sql_safety(sql).allowed is False
