@@ -858,3 +858,60 @@ class TestGrantWildcard:
         prefix = get_session_prefix()
         sql = f"GRANT SELECT ON DATABASE {prefix}db TO root"
         assert check_sql_safety(sql).allowed is False
+
+
+class TestMultiTargetWriteRules:
+    """Write rules must validate every target, not only the first identifier."""
+
+    @pytest.mark.parametrize(
+        "statement",
+        [
+            "DROP TABLE {p}t, production.users",
+            "DROP TABLE IF EXISTS {p}a, production.users",
+            "DROP VIEW {p}v, production.v2",
+            "DROP USER {p}u, production.u",
+            "TRUNCATE TABLE {p}t, production.events",
+            "TRUNCATE {p}t, production.events",
+        ],
+    )
+    def test_comma_separated_targets_blocked(self, statement):
+        sql = statement.format(p=get_session_prefix())
+        result = check_sql_safety(sql)
+        assert result.allowed is False
+        assert "production" in result.reason
+
+    @pytest.mark.parametrize(
+        "statement",
+        [
+            "DROP TABLE {p}a, {p}b",
+            "TRUNCATE TABLE {p}t, {p}t2",
+        ],
+    )
+    def test_comma_separated_sandbox_targets_allowed(self, statement):
+        sql = statement.format(p=get_session_prefix())
+        assert check_sql_safety(sql).allowed is True
+
+    @pytest.mark.parametrize(
+        "statement",
+        [
+            "ALTER TABLE {p}db.t RENAME TO production.pwned",
+            "ALTER TABLE {p}t SWAP WITH production.users",
+            "ALTER DATABASE {p}db RENAME TO production",
+            "ALTER WAREHOUSE {p}wh RENAME TO prod_wh",
+        ],
+    )
+    def test_alter_destination_blocked(self, statement):
+        sql = statement.format(p=get_session_prefix())
+        result = check_sql_safety(sql)
+        assert result.allowed is False
+        assert "ALTER" in result.reason
+
+    def test_alter_rename_inside_sandbox_allowed(self):
+        prefix = get_session_prefix()
+        sql = f"ALTER TABLE {prefix}db.t RENAME TO {prefix}db.t2"
+        assert check_sql_safety(sql).allowed is True
+
+    def test_alter_rename_column_allowed(self):
+        prefix = get_session_prefix()
+        sql = f"ALTER TABLE {prefix}db.t RENAME COLUMN a TO b"
+        assert check_sql_safety(sql).allowed is True

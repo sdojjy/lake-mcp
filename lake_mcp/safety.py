@@ -403,7 +403,7 @@ def _check_create_drop(sql: str, session_prefix: str) -> SafetyResult | None:
     # Support db.table format
     match = re.search(
         rf"\b(CREATE|DROP)\s+({CREATE_DROP_OBJECTS})\s+"
-        rf"(?:IF\s+(?:NOT\s+)?EXISTS\s+)?({IDENTIFIER_PATTERN})",
+        rf"(?:IF\s+(?:NOT\s+)?EXISTS\s+)?({IDENTIFIER_LIST_PATTERN})",
         sql,
         re.IGNORECASE,
     )
@@ -411,15 +411,19 @@ def _check_create_drop(sql: str, session_prefix: str) -> SafetyResult | None:
         return None
 
     obj_type = match.group(2).upper()
-    obj_name = match.group(3)
+    obj_names = match.group(3)
 
-    # Check object name has sandbox prefix
-    name, is_sandbox = _extract_identifier(obj_name, session_prefix)
-    if not is_sandbox:
-        return SafetyResult(
-            allowed=False,
-            reason=f"Operation blocked: '{name}' must start with {session_prefix}",
-        )
+    # DROP accepts a comma-separated target list, so every target is checked -
+    # approving the statement on the strength of its first (sandbox) name would
+    # let "DROP TABLE sandbox.t, production.users" through.
+    targets = re.findall(IDENTIFIER_PATTERN, obj_names, re.IGNORECASE) or [obj_names]
+    for obj_name in targets:
+        name, is_sandbox = _extract_identifier(obj_name, session_prefix)
+        if not is_sandbox:
+            return SafetyResult(
+                allowed=False,
+                reason=f"Operation blocked: '{name}' must start with {session_prefix}",
+            )
 
     # For TASK/PIPE, check nested SQL references
     if obj_type in ("TASK", "PIPE"):
@@ -599,12 +603,25 @@ def _check_alter(sql: str, session_prefix: str) -> SafetyResult | None:
 
     obj_name = match.group(2)
     name, is_sandbox = _extract_identifier(obj_name, session_prefix)
-    if is_sandbox:
-        return SafetyResult(allowed=True)
-    return SafetyResult(
-        allowed=False,
-        reason=f"ALTER blocked: '{name}' must start with {session_prefix}",
-    )
+    if not is_sandbox:
+        return SafetyResult(
+            allowed=False,
+            reason=f"ALTER blocked: '{name}' must start with {session_prefix}",
+        )
+
+    # RENAME TO / SWAP WITH move or exchange objects, so their destination must
+    # stay inside the sandbox: "ALTER TABLE sandbox.t RENAME TO production.pwned"
+    # and "ALTER TABLE sandbox.t SWAP WITH production.users" write outside it.
+    for keyword in ("RENAME TO", "SWAP WITH"):
+        for dest_match in re.finditer(rf"\b{keyword}\s+({IDENTIFIER_PATTERN})", sql, re.IGNORECASE):
+            dest_name, dest_is_sandbox = _extract_identifier(dest_match.group(1), session_prefix)
+            if not dest_is_sandbox:
+                return SafetyResult(
+                    allowed=False,
+                    reason=f"ALTER {keyword} blocked: '{dest_name}' must start with {session_prefix}",
+                )
+
+    return SafetyResult(allowed=True)
 
 
 def _check_optimize_vacuum(sql: str, session_prefix: str) -> SafetyResult | None:
@@ -689,32 +706,43 @@ def _check_grant_revoke(sql: str, session_prefix: str) -> SafetyResult | None:
 def _check_dml(sql: str, session_prefix: str) -> SafetyResult | None:
     """Rule: DML operations must be on sandbox objects."""
     # Support db.table format
+    # TRUNCATE accepts a comma-separated target list, every other DML statement
+    # here has a single target.
     dml_patterns = [
-        (rf"\bINSERT\s+(?:INTO\s+)?({IDENTIFIER_PATTERN})", "INSERT"),
-        (rf"\bUPDATE\s+({IDENTIFIER_PATTERN})", "UPDATE"),
-        (rf"\bDELETE\s+FROM\s+({IDENTIFIER_PATTERN})", "DELETE"),
-        (rf"\bTRUNCATE\s+(?:TABLE\s+)?({IDENTIFIER_PATTERN})", "TRUNCATE"),
-        (rf"\bCOPY\s+INTO\s+({IDENTIFIER_PATTERN})", "COPY INTO"),
-        (rf"\bMERGE\s+INTO\s+({IDENTIFIER_PATTERN})", "MERGE INTO"),
+        (rf"\bINSERT\s+(?:INTO\s+)?({IDENTIFIER_PATTERN})", "INSERT", False),
+        (rf"\bUPDATE\s+({IDENTIFIER_PATTERN})", "UPDATE", False),
+        (rf"\bDELETE\s+FROM\s+({IDENTIFIER_PATTERN})", "DELETE", False),
+        (rf"\bTRUNCATE\s+(?:TABLE\s+)?({IDENTIFIER_LIST_PATTERN})", "TRUNCATE", True),
+        (rf"\bCOPY\s+INTO\s+({IDENTIFIER_PATTERN})", "COPY INTO", False),
+        (rf"\bMERGE\s+INTO\s+({IDENTIFIER_PATTERN})", "MERGE INTO", False),
     ]
 
-    for pattern, op_name in dml_patterns:
+    for pattern, op_name, multiple_targets in dml_patterns:
         match = re.search(pattern, sql, re.IGNORECASE)
-        if match:
-            obj_name = match.group(1)
+        if not match:
+            continue
+
+        obj_names = match.group(1)
+        if multiple_targets:
+            targets = re.findall(IDENTIFIER_PATTERN, obj_names, re.IGNORECASE) or [obj_names]
+        else:
+            targets = [obj_names]
+
+        for obj_name in targets:
             name, is_sandbox = _extract_identifier(obj_name, session_prefix)
-            if is_sandbox:
-                # Check if SQL contains non-sandbox references in FROM/JOIN
-                if _contains_non_sandbox_reference(sql, session_prefix):
-                    return SafetyResult(
-                        allowed=False,
-                        reason=f"{op_name} blocked: SQL references non-sandbox objects. All objects must start with {session_prefix}",
-                    )
-                return SafetyResult(allowed=True)
+            if not is_sandbox:
+                return SafetyResult(
+                    allowed=False,
+                    reason=f"{op_name} blocked: '{name}' must start with {session_prefix}",
+                )
+
+        # Check if SQL contains non-sandbox references in FROM/JOIN
+        if _contains_non_sandbox_reference(sql, session_prefix):
             return SafetyResult(
                 allowed=False,
-                reason=f"{op_name} blocked: '{name}' must start with {session_prefix}",
+                reason=f"{op_name} blocked: SQL references non-sandbox objects. All objects must start with {session_prefix}",
             )
+        return SafetyResult(allowed=True)
     return None
 
 
