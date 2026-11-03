@@ -711,3 +711,107 @@ class TestSQLStandardization:
         sql = "INSERT/*comment*/INTO production.users VALUES (1)"
         result = check_sql_safety(sql)
         assert result.allowed is False
+
+
+class TestStatementBoundaries:
+    """A statement must not ride on the approval of another one."""
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT 1; DROP DATABASE production",
+            "SHOW DATABASES; DROP TABLE production.users",
+            "DESC mydb.t; DROP DATABASE production",
+            "SELECT 1; SELECT 2",
+        ],
+    )
+    def test_stacked_statements_blocked(self, sql):
+        result = check_sql_safety(sql)
+        assert result.allowed is False
+        assert "Multiple SQL statements" in result.reason
+
+    def test_stacked_statement_after_sandbox_write_blocked(self):
+        sql = f"INSERT INTO {get_session_prefix()}db.t VALUES (1); DROP DATABASE production"
+        result = check_sql_safety(sql)
+        assert result.allowed is False
+        assert "Multiple SQL statements" in result.reason
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT * FROM production.users;",
+            "  SELECT 1 ;  ",
+            f"CREATE OR REPLACE PROCEDURE {get_session_prefix()}proc AS $$ SELECT 1; SELECT 2 $$",
+        ],
+    )
+    def test_single_statement_with_trailing_separator_allowed(self, sql):
+        assert check_sql_safety(sql).allowed is True
+
+    def test_semicolon_inside_string_is_not_a_separator(self):
+        assert check_sql_safety("SELECT * FROM t WHERE c = 'a;b'").allowed is True
+        assert check_sql_safety("SELECT * FROM t WHERE c = 'it''s; fine'").allowed is True
+
+    def test_semicolon_inside_comment_is_not_a_separator(self):
+        assert check_sql_safety("SELECT 1 -- ; DROP DATABASE production").allowed is True
+        assert check_sql_safety("SELECT 1 /* ; DROP DATABASE production */").allowed is True
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT 'unterminated",
+            "SELECT 1 /* unterminated",
+            "SELECT `unterminated",
+        ],
+    )
+    def test_untokenizable_sql_blocked(self, sql):
+        result = check_sql_safety(sql)
+        assert result.allowed is False
+        assert "tokenized" in result.reason
+
+
+class TestReadOnlyPrefixNarrowing:
+    """The read-only rule must describe the whole statement, not just a prefix."""
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "EXPLAIN ANALYZE DELETE FROM production.users",
+            "EXPLAIN ANALYZE INSERT INTO production.users VALUES (1)",
+            "EXPLAIN ANALYZE UPDATE production.users SET admin = true",
+            "EXPLAIN DROP DATABASE production",
+            "EXPLAIN CREATE USER evil IDENTIFIED BY 'x'",
+        ],
+    )
+    def test_explain_of_write_blocked(self, sql):
+        assert check_sql_safety(sql).allowed is False
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "EXPLAIN SELECT * FROM production.users",
+            "EXPLAIN ANALYZE SELECT * FROM production.users",
+            "EXPLAIN AST SELECT 1",
+            "EXPLAIN SYNTAX SELECT 1",
+        ],
+    )
+    def test_explain_of_read_allowed(self, sql):
+        assert check_sql_safety(sql).allowed is True
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "WITH cte AS (SELECT 1) DELETE FROM production.users",
+            "WITH cte AS (SELECT 1) UPDATE production.users SET admin = true",
+            "WITH cte AS (SELECT 1) DROP DATABASE production",
+            "WITH RECURSIVE cte AS (SELECT 1) DELETE FROM production.users",
+        ],
+    )
+    def test_cte_write_on_non_sandbox_blocked(self, sql):
+        assert check_sql_safety(sql).allowed is False
+
+    def test_cte_select_allowed(self):
+        assert check_sql_safety("WITH cte AS (SELECT 1) SELECT * FROM cte").allowed is True
+
+    def test_cte_write_on_sandbox_allowed(self):
+        sql = f"WITH cte AS (SELECT 1) DELETE FROM {get_session_prefix()}db.t"
+        assert check_sql_safety(sql).allowed is True

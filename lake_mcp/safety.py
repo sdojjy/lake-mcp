@@ -15,6 +15,7 @@ ARCHITECTURE: Modular rule-based system
 
 import re
 import secrets
+import threading
 from dataclasses import dataclass
 from typing import Callable
 
@@ -22,7 +23,12 @@ from typing import Callable
 SESSION_ID = secrets.token_hex(4)
 SANDBOX_PREFIX = "mcp_sandbox_"
 
+# Maximum nesting of deferred statements (TASK/PIPE/DYNAMIC TABLE bodies).
+MAX_NESTED_SQL_DEPTH = 3
+
 IDENTIFIER_PATTERN = r"[`\'\"]?\w+[`\'\"]?(?:\.[`\'\"]?\w+[`\'\"]?)?"
+# DROP/TRUNCATE accept comma-separated target lists; every target must be checked.
+IDENTIFIER_LIST_PATTERN = rf"{IDENTIFIER_PATTERN}(?:\s*,\s*{IDENTIFIER_PATTERN})*"
 INDEX_TYPE_PATTERN = r"(?:AGGREGATING|INVERTED|NGRAM|VECTOR)"
 CREATE_OR_REPLACE_OBJECTS = (
     r"(?:TABLE|VIEW|FUNCTION|STAGE|TASK|PIPE|STREAM|WAREHOUSE|SEQUENCE|PROCEDURE|DICTIONARY"
@@ -77,6 +83,94 @@ def _standardize_sql(sql: str) -> str:
     # Normalize whitespace (including newlines) to single space
     sql = re.sub(r"\s+", " ", sql)
     return sql.strip()
+
+
+_QUOTE_CHARS = ("'", '"', "`")
+_DOLLAR_QUOTE_RE = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*)?\$")
+
+
+def _skip_quoted(sql: str, start: int) -> int | None:
+    """Return the index just past the quoted token starting at `start`, or None if unterminated."""
+    quote = sql[start]
+    index = start + 1
+    length = len(sql)
+    while index < length:
+        char = sql[index]
+        if char == "\\" and quote == "'":
+            index += 2
+            continue
+        if char == quote:
+            # Doubled quotes are escapes inside the literal.
+            if index + 1 < length and sql[index + 1] == quote:
+                index += 2
+                continue
+            return index + 1
+        index += 1
+    return None
+
+
+def _split_sql_statements(sql: str) -> list[str] | None:
+    """Split SQL text into statements on top-level semicolons.
+
+    String literals, quoted identifiers, line/block comments and dollar-quoted
+    bodies ($$ ... $$) are skipped so a semicolon inside them never starts a new
+    statement. Returns None when the input cannot be tokenized unambiguously
+    (unterminated quote or block comment); callers must treat that as a denial.
+    """
+    statements: list[str] = []
+    current: list[str] = []
+    index = 0
+    length = len(sql)
+
+    while index < length:
+        char = sql[index]
+
+        if char in _QUOTE_CHARS:
+            end = _skip_quoted(sql, index)
+            if end is None:
+                return None
+            current.append(sql[index:end])
+            index = end
+            continue
+
+        if char == "$":
+            dollar_match = _DOLLAR_QUOTE_RE.match(sql, index)
+            if dollar_match:
+                tag = dollar_match.group(0)
+                end = sql.find(tag, dollar_match.end())
+                if end == -1:
+                    return None
+                end += len(tag)
+                current.append(sql[index:end])
+                index = end
+                continue
+
+        if sql.startswith("--", index):
+            # Line comment: skip to the end of the line, newline stays in the statement.
+            end = sql.find("\n", index)
+            index = length if end == -1 else end
+            continue
+
+        if sql.startswith("/*", index):
+            end = sql.find("*/", index + 2)
+            if end == -1:
+                return None
+            end += 2
+            current.append(sql[index:end])
+            index = end
+            continue
+
+        if char == ";":
+            statements.append("".join(current))
+            current = []
+            index += 1
+            continue
+
+        current.append(char)
+        index += 1
+
+    statements.append("".join(current))
+    return [statement.strip() for statement in statements if statement.strip()]
 
 
 def _extract_identifier(identifier: str, session_prefix: str) -> tuple[str, bool]:
@@ -189,20 +283,117 @@ def _check_replace_into(sql: str, session_prefix: str) -> SafetyResult | None:
     )
 
 
+_STATEMENT_VERBS = frozenset(
+    {
+        "ALTER",
+        "ANALYZE",
+        "BEGIN",
+        "CALL",
+        "COMMIT",
+        "COPY",
+        "CREATE",
+        "DELETE",
+        "DESC",
+        "DESCRIBE",
+        "DROP",
+        "EXPLAIN",
+        "GRANT",
+        "INSERT",
+        "LIST",
+        "MERGE",
+        "OPTIMIZE",
+        "PRAGMA",
+        "REMOVE",
+        "REPLACE",
+        "REVOKE",
+        "ROLLBACK",
+        "SELECT",
+        "SET",
+        "SHOW",
+        "TRUNCATE",
+        "UNDROP",
+        "UPDATE",
+        "USE",
+        "VACUUM",
+    }
+)
+_EXPLAIN_OPTIONS = (
+    "ANALYZE",
+    "AST",
+    "SYNTAX",
+    "GRAPH",
+    "PIPELINE",
+    "JOIN",
+    "FRAGMENTS",
+    "RAW",
+    "OPTIMIZED",
+    "TREE",
+    "JSON",
+    "FORMAT",
+)
+_EXPLAIN_OPTIONS_RE = re.compile(rf"^(?:{'|'.join(_EXPLAIN_OPTIONS)})\b\s*")
+_CTE_NAME_RE = re.compile(r"\s*(?:\([^)]*\)\s*)?AS\s*\(", re.IGNORECASE)
+
+
+def _first_top_level_verb(sql: str, skip_cte_names: bool = False) -> str | None:
+    """Return the first statement verb at parenthesis depth 0, or None.
+
+    With ``skip_cte_names`` tokens followed by ``AS (`` (i.e. CTE names) are
+    skipped, so ``WITH cte AS (...) DELETE FROM t`` yields ``DELETE``.
+    """
+    depth = 0
+    index = 0
+    length = len(sql)
+    while index < length:
+        char = sql[index]
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+        elif depth == 0 and (char.isalpha() or char == "_"):
+            end = index + 1
+            while end < length and (sql[end].isalnum() or sql[end] == "_"):
+                end += 1
+            if skip_cte_names and _CTE_NAME_RE.match(sql, end):
+                index = end
+                continue
+            word = sql[index:end].upper()
+            if word in _STATEMENT_VERBS:
+                return word
+            index = end
+            continue
+        index += 1
+    return None
+
+
 def _check_read_only(sql: str, session_prefix: str) -> SafetyResult | None:
-    """Rule: Allow read-only queries on ANY object."""
-    patterns = [
-        r"^\s*SELECT\b",
-        r"^\s*WITH\b.*\bSELECT\b",
-        r"^\s*SHOW\b",
-        r"^\s*DESCRIBE\b",
-        r"^\s*DESC\b",
-        r"^\s*EXPLAIN\b",
-        r"^\s*LIST\s+@",
-    ]
+    """Rule: Allow read-only queries on ANY object.
+
+    The read prefix must describe the *whole* statement: ``EXPLAIN ANALYZE
+    DELETE ...`` and ``WITH ... DELETE ...`` are not read-only and fall through
+    to the write rules below.
+    """
     sql_upper = sql.strip().upper()
-    for pattern in patterns:
-        if re.match(pattern, sql_upper, re.DOTALL):
+
+    if re.match(r"^EXPLAIN\b", sql_upper):
+        remainder = sql_upper[len("EXPLAIN") :].lstrip()
+        while True:
+            option = _EXPLAIN_OPTIONS_RE.match(remainder)
+            if not option:
+                break
+            remainder = remainder[option.end() :]
+        if not remainder:
+            return None
+        return _check_read_only(remainder, session_prefix)
+
+    if re.match(r"^SELECT\b", sql_upper):
+        return SafetyResult(allowed=True)
+    if re.match(r"^(?:SHOW|DESCRIBE|DESC)\b", sql_upper):
+        return SafetyResult(allowed=True)
+    if re.match(r"^LIST\s+@", sql_upper):
+        return SafetyResult(allowed=True)
+    if re.match(r"^WITH\b", sql_upper):
+        if _first_top_level_verb(sql_upper[len("WITH") :], skip_cte_names=True) == "SELECT":
             return SafetyResult(allowed=True)
     return None
 
@@ -556,8 +747,12 @@ def check_sql_safety(sql: str) -> SafetyResult:
     """
     Check if SQL is safe - STRICT whitelist approach.
 
-    Rules are checked in order. First matching rule determines the result.
-    If no rule matches, operation is REJECTED by default.
+    Exactly one statement is accepted per call. Rules are checked in order and
+    the first matching rule determines the result; if no rule matches, the
+    operation is REJECTED by default. Because the caller forwards the original
+    string to the driver, the gate decides on the same statement text that will
+    be executed - multiple statements separated by ``;`` are never approved on
+    the strength of the first one.
 
     Args:
         sql: SQL query string
@@ -565,6 +760,27 @@ def check_sql_safety(sql: str) -> SafetyResult:
     Returns:
         SafetyResult with allowed status and reason if blocked
     """
+    statements = _split_sql_statements(sql)
+    if statements is None:
+        return SafetyResult(
+            allowed=False,
+            reason="SQL could not be tokenized safely (unterminated string, quoted identifier or comment)",
+        )
+    if not statements:
+        return SafetyResult(allowed=False, reason="Empty SQL statement")
+    if len(statements) > 1:
+        return SafetyResult(
+            allowed=False,
+            reason=(
+                f"Multiple SQL statements are not allowed in one call (found {len(statements)}). "
+                "Submit each statement separately."
+            ),
+        )
+    return _check_single_statement(statements[0])
+
+
+def _check_single_statement(sql: str) -> SafetyResult:
+    """Run the rule chain over one statement."""
     # Standardize SQL format first
     sql_std = _standardize_sql(sql)
     session_prefix = get_session_prefix()
@@ -580,3 +796,49 @@ def check_sql_safety(sql: str) -> SafetyResult:
         allowed=False,
         reason=f"Operation not allowed. Only read operations and writes to {session_prefix}* objects are permitted.",
     )
+
+
+_NESTED_STATE = threading.local()
+
+
+def _check_nested_sql(sql: str) -> SafetyResult:
+    """Validate a deferred statement body with the full rule chain."""
+    depth = getattr(_NESTED_STATE, "depth", 0)
+    if depth >= MAX_NESTED_SQL_DEPTH:
+        return SafetyResult(
+            allowed=False,
+            reason=f"Nested SQL is nested deeper than {MAX_NESTED_SQL_DEPTH} levels",
+        )
+    _NESTED_STATE.depth = depth + 1
+    try:
+        return check_sql_safety(sql)
+    finally:
+        _NESTED_STATE.depth = depth
+
+
+def _check_nested_body(sql: str, object_label: str, session_prefix: str) -> SafetyResult | None:
+    """Validate the ``AS <body>`` statement of CREATE ... AS constructs.
+
+    Returns a denial when the body references non-sandbox objects or is not
+    itself allowed by the rule chain (e.g. ``CREATE TASK t AS DROP TABLE prod``).
+    """
+    as_match = re.search(r"\bAS\s+(.+)$", sql, re.IGNORECASE | re.DOTALL)
+    if not as_match:
+        return None
+    nested_sql = as_match.group(1).strip()
+    if not nested_sql:
+        return None
+
+    if _contains_non_sandbox_reference(nested_sql, session_prefix):
+        return SafetyResult(
+            allowed=False,
+            reason=f"{object_label} blocked: Referenced object in nested SQL must start with {session_prefix}",
+        )
+
+    nested_result = _check_nested_sql(nested_sql)
+    if not nested_result.allowed:
+        return SafetyResult(
+            allowed=False,
+            reason=f"{object_label} blocked: nested SQL is not allowed ({nested_result.reason})",
+        )
+    return None
