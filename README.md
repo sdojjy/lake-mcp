@@ -145,3 +145,28 @@ npx @modelcontextprotocol/inspector uv run python -m lake_mcp.main
 # Test
 uv run pytest
 ```
+
+### Security configuration
+
+The sandbox gate is an additional client-side guard; the warehouse user still
+needs the minimum database grants. A stdio process belongs to its local caller.
+A shared HTTP/SSE process does not provide per-user database or tenant isolation.
+
+For HTTP/SSE, set `LAKE_MCP_AUTH_TOKEN` to enable bearer authentication and
+`LAKE_MCP_REQUIRE_AUTH=true` to fail startup if it is missing. Clients must send
+`Authorization: Bearer <token>`. Keep a plaintext listener on a trusted interface
+or use your existing HTTPS endpoint. A shared bearer token authenticates access
+to this process; it does not create separate warehouse identities. The legacy
+unauthenticated local configuration is preserved unless strict mode is selected.
+
+Environment files are now explicit: set `LAKE_MCP_ENV_FILE` to an absolute file
+path when needed. Parent-directory `.env` discovery is disabled so an unrelated
+file cannot disable safe mode or redirect the connection. Existing environment
+variables retain precedence. Launchers that relied on automatic discovery must
+set this path or provide environment variables directly.
+
+SHOW `filter` remains a SQL expression and reads remain available subject to the
+warehouse user's grants. Storage connections and stage URLs are also constrained
+by warehouse grants and server policy; this client is not an SSRF or multi-user
+security boundary. Do not grant an untrusted shared MCP process administrative
+or production storage permissions.

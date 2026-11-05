@@ -6,11 +6,11 @@ import sys
 from typing import Optional
 
 import pyarrow as pa
-from dotenv import load_dotenv
 from fastmcp import FastMCP
 from fastmcp.tools import Tool
 
 from .env import TransportType, get_config
+from .runtime_security import build_auth, load_config_file
 from .safety import SESSION_ID, check_sql_safety, get_session_prefix, has_top_level_separator
 
 # Constants
@@ -29,10 +29,10 @@ QUERY_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=10)
 atexit.register(lambda: QUERY_EXECUTOR.shutdown(wait=True))
 
 # Load environment variables
-load_dotenv()
+load_config_file()
 
 # Initialize MCP server
-mcp = FastMCP(SERVER_NAME)
+mcp = FastMCP(SERVER_NAME, auth=build_auth())
 
 # Global Lake client singleton
 _lake_client = None
