@@ -1,7 +1,7 @@
 """Security and compatibility regressions for the FastMCP 3 upgrade."""
 
 import asyncio
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
 import pytest
 from fastmcp import Client
@@ -14,7 +14,14 @@ from lake_mcp import server
 @pytest.mark.parametrize("value", ["alice", "../../../admin/delete-all?", "..", ".", "a/b", "//other-host/path", "a?b#c", "%2e%2e%2f"])
 def test_openapi_path_parameters_remain_literal(value):
     director = RequestDirector(SchemaPath.from_dict({}))
-    url = director._build_url("/api/v1/users/{id}/profile", {"id": value}, "https://backend.example/")
+    try:
+        url = director._build_url("/api/v1/users/{id}/profile", {"id": value}, "https://backend.example/")
+    except ValueError:
+        # Newer FastMCP versions reject dot segments instead of encoding them.
+        # Both outcomes are safe; ordinary path values must remain usable.
+        decoded = unquote(value).replace("\\", "/")
+        assert any(part in {".", ".."} for part in decoded.split("/"))
+        return
 
     encoded = quote(value, safe="").replace(".", "%2E")
     assert url == f"https://backend.example/api/v1/users/{encoded}/profile"
