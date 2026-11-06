@@ -10,7 +10,7 @@ from fastmcp import FastMCP
 from fastmcp.tools import Tool
 
 from .env import TransportType, get_config
-from .runtime_security import build_auth, load_config_file
+from .runtime_security import build_auth, load_config_file, network_run_options
 from .safety import SESSION_ID, check_sql_safety, get_session_prefix, has_top_level_separator
 
 # Constants
@@ -543,6 +543,7 @@ def main():
                 transport=transport,
                 host=config.mcp_bind_host,
                 port=config.mcp_bind_port,
+                **network_run_options(config, mcp.auth),
             )
         else:
             # For stdio transport, no host or port is needed

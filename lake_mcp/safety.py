@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 # Session ID: generated at server startup, constant for process lifetime
-SESSION_ID = secrets.token_hex(4)
+SESSION_ID = secrets.token_hex(16)
 SANDBOX_PREFIX = "mcp_sandbox_"
 
 # Maximum nesting of deferred statements (TASK/PIPE/DYNAMIC TABLE bodies).
@@ -1025,12 +1025,25 @@ def _check_nested_body(sql: str, object_label: str, session_prefix: str) -> Safe
     Returns a denial when the body references non-sandbox objects or is not
     itself allowed by the rule chain (e.g. ``CREATE TASK t AS DROP TABLE prod``).
     """
-    as_match = _sql_search(r"\bAS\s+(.+)$", sql, re.IGNORECASE | re.DOTALL)
-    if not as_match:
-        return None
-    nested_sql = as_match.group(1).strip()
+    # Tokenize first: a greedy regex starting inside a literal can consume
+    # the real AS and make the deferred body disappear from validation.
+    as_token = None
+    depth = 0
+    for token in _sql_tokens(sql):
+        if token.kind == "symbol" and token.text == "(":
+            depth += 1
+        elif token.kind == "symbol" and token.text == ")":
+            depth -= 1
+        elif depth == 0 and token.kind == "word" and token.text.upper() == "AS":
+            as_token = token
+            break
+    if as_token is None:
+        if object_label == "CREATE INDEX":
+            return None
+        return SafetyResult(allowed=False, reason=f"{object_label} blocked: missing AS body")
+    nested_sql = sql[as_token.end :].strip()
     if not nested_sql:
-        return None
+        return SafetyResult(allowed=False, reason=f"{object_label} blocked: empty AS body")
 
     if _contains_non_sandbox_reference(nested_sql, session_prefix):
         return SafetyResult(

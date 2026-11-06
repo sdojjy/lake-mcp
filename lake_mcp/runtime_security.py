@@ -32,3 +32,19 @@ def build_auth():
     if not token:
         return None
     return StaticTokenVerifier(tokens={token: {"client_id": "lake-mcp", "scopes": ["lake"]}}, required_scopes=["lake"])
+
+
+def network_run_options(config, auth):
+    """Validate the actual mounted authenticator before opening a listener."""
+    from starlette.middleware import Middleware
+    from starlette.middleware.trustedhost import TrustedHostMiddleware
+
+    insecure = os.environ.get("LAKE_MCP_ALLOW_INSECURE_HTTP", "false").strip().lower()
+    if insecure not in {"true", "false", "1", "0", "yes", "no", "on", "off"}:
+        raise ValueError("Invalid LAKE_MCP_ALLOW_INSECURE_HTTP; use true or false")
+    if auth is None and insecure not in {"true", "1", "yes", "on"}:
+        raise ValueError("HTTP/SSE requires LAKE_MCP_AUTH_TOKEN; local development may explicitly set LAKE_MCP_ALLOW_INSECURE_HTTP=true")
+    hosts = [h.strip() for h in os.environ.get("LAKE_MCP_ALLOWED_HOSTS", "localhost,127.0.0.1,[::1]").split(",") if h.strip()]
+    if not hosts or "*" in hosts:
+        raise ValueError("LAKE_MCP_ALLOWED_HOSTS must list explicit hosts")
+    return {"middleware": [Middleware(TrustedHostMiddleware, allowed_hosts=hosts)]}

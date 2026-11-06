@@ -170,3 +170,16 @@ warehouse user's grants. Storage connections and stage URLs are also constrained
 by warehouse grants and server policy; this client is not an SSRF or multi-user
 security boundary. Do not grant an untrusted shared MCP process administrative
 or production storage permissions.
+
+### Network listener security
+
+HTTP/SSE requires a configured bearer token. Stdio remains local and needs no
+network token. For an intentionally anonymous local development listener, set
+`LAKE_MCP_ALLOW_INSECURE_HTTP=true` explicitly. `LAKE_MCP_ALLOWED_HOSTS` defaults
+to localhost/loopback; provide a comma-separated list of exact service hostnames
+when exposing the listener through a proxy (wildcards are rejected).
+
+A process and its configured bearer token form one owner/trust domain. The
+128-bit sandbox prefix prevents accidental name collisions, and is deliberately
+public to that owner; it is not an authentication token or a replacement for
+warehouse grants. Run separate processes/credentials for untrusted owners.

@@ -4,6 +4,7 @@ import sys
 
 from .env import TransportType, get_config
 from .server import logger, mcp
+from .runtime_security import network_run_options
 
 
 def main():
@@ -23,6 +24,7 @@ def main():
                 transport=transport,
                 host=config.mcp_bind_host,
                 port=config.mcp_bind_port,
+                **network_run_options(config, mcp.auth),
             )
         else:
             # For stdio transport, no host or port is needed
