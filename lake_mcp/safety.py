@@ -587,8 +587,10 @@ def _is_qualified_name(name: str) -> bool:
 
 def _check_alter(sql: str, session_prefix: str) -> SafetyResult | None:
     """Rule: ALTER operations must be on sandbox objects."""
+    # Reject partial matches of unsupported multi-part identifiers.
+    target = rf"({IDENTIFIER_PATTERN})(?=\s|$)(?!\s*\.)"
     match = _sql_search(
-        rf"^ALTER\s+({ALTER_OBJECTS})\s+({IDENTIFIER_PATTERN})(?=\s|$)",
+        rf"^ALTER\s+({ALTER_OBJECTS})\s+{target}",
         sql,
         re.IGNORECASE,
     )
@@ -610,7 +612,11 @@ def _check_alter(sql: str, session_prefix: str) -> SafetyResult | None:
     # stay inside the sandbox: "ALTER TABLE sandbox.t RENAME TO production.pwned"
     # and "ALTER TABLE sandbox.t SWAP WITH production.users" write outside it.
     for keyword in ("RENAME TO", "SWAP WITH"):
-        for dest_match in _sql_finditer(rf"\b{keyword}\s+({IDENTIFIER_PATTERN})", sql, re.IGNORECASE):
+        keyword_pattern = r"\s+".join(keyword.split())
+        for move in _sql_finditer(rf"\b{keyword_pattern}\b", sql, re.IGNORECASE):
+            dest_match = re.match(rf"\s+{target}", sql[move.end() :])
+            if dest_match is None:
+                return SafetyResult(False, f"ALTER {keyword} blocked: invalid destination")
             destination = dest_match.group(1)
             dest_name, dest_is_sandbox = _extract_identifier(destination, session_prefix)
             if _is_qualified_name(destination):
