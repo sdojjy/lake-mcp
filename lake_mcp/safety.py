@@ -539,7 +539,7 @@ def _check_tag_actions(sql: str, session_prefix: str) -> SafetyResult | None:
         return None
 
     target_match = _sql_search(
-        rf"\bALTER\s+({TAG_TARGET_OBJECTS})\s+({IDENTIFIER_PATTERN})",
+        rf"^ALTER\s+({TAG_TARGET_OBJECTS})\s+({IDENTIFIER_PATTERN})\s+(?:SET|UNSET)\s+TAG\s+(.+)$",
         sql,
         re.IGNORECASE,
     )
@@ -557,14 +557,11 @@ def _check_tag_actions(sql: str, session_prefix: str) -> SafetyResult | None:
             reason=f"ALTER TAG blocked: '{name}' must start with {session_prefix}",
         )
 
-    tags_match = _sql_search(r"\b(?:SET|UNSET)\s+TAG\s+(.+)$", sql, re.IGNORECASE)
-    if not tags_match:
-        return SafetyResult(
-            allowed=False,
-            reason=f"ALTER TAG blocked: tag names must start with {session_prefix}",
-        )
+    # A tag rule must never short-circuit the destination checks on an ALTER.
+    if _sql_search(r"\b(?:RENAME\s+TO|SWAP\s+WITH)\b", sql, re.IGNORECASE):
+        return SafetyResult(False, "ALTER TAG blocked: cannot combine tag and object move operations")
 
-    tag_items = [item.strip() for item in tags_match.group(1).split(",") if item.strip()]
+    tag_items = [item.strip() for item in target_match.group(3).split(",") if item.strip()]
     if not tag_items:
         return SafetyResult(
             allowed=False,
@@ -590,8 +587,10 @@ def _is_qualified_name(name: str) -> bool:
 
 def _check_alter(sql: str, session_prefix: str) -> SafetyResult | None:
     """Rule: ALTER operations must be on sandbox objects."""
+    # Reject partial matches of unsupported multi-part identifiers.
+    target = rf"({IDENTIFIER_PATTERN})(?=\s|$)(?!\s*\.)"
     match = _sql_search(
-        rf"\bALTER\s+({ALTER_OBJECTS})\s+({IDENTIFIER_PATTERN})",
+        rf"^ALTER\s+({ALTER_OBJECTS})\s+{target}",
         sql,
         re.IGNORECASE,
     )
@@ -613,7 +612,11 @@ def _check_alter(sql: str, session_prefix: str) -> SafetyResult | None:
     # stay inside the sandbox: "ALTER TABLE sandbox.t RENAME TO production.pwned"
     # and "ALTER TABLE sandbox.t SWAP WITH production.users" write outside it.
     for keyword in ("RENAME TO", "SWAP WITH"):
-        for dest_match in _sql_finditer(rf"\b{keyword}\s+({IDENTIFIER_PATTERN})", sql, re.IGNORECASE):
+        keyword_pattern = r"\s+".join(keyword.split())
+        for move in _sql_finditer(rf"\b{keyword_pattern}\b", sql, re.IGNORECASE):
+            dest_match = re.match(rf"\s+{target}", sql[move.end() :])
+            if dest_match is None:
+                return SafetyResult(False, f"ALTER {keyword} blocked: invalid destination")
             destination = dest_match.group(1)
             dest_name, dest_is_sandbox = _extract_identifier(destination, session_prefix)
             if _is_qualified_name(destination):
