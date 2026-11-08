@@ -175,7 +175,9 @@ or production storage permissions.
 
 HTTP/SSE requires a configured bearer token. Stdio remains local and needs no
 network token. For an intentionally anonymous local development listener, set
-`LAKE_MCP_ALLOW_INSECURE_HTTP=true` explicitly. `LAKE_MCP_ALLOWED_HOSTS` defaults
+`LAKE_MCP_ALLOW_INSECURE_HTTP=true` explicitly and bind to a loopback address
+such as `127.0.0.1` or `::1`. The `localhost` alias binds to `127.0.0.1`.
+`LAKE_MCP_ALLOWED_HOSTS` defaults
 to localhost/loopback; provide a comma-separated list of exact service hostnames
 when exposing the listener through a proxy (wildcards are rejected).
 

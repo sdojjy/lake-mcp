@@ -771,62 +771,62 @@ def _read_qualified_tail(target: str, index: int) -> str:
     return tail
 
 
-def _check_grant_revoke(sql: str, session_prefix: str) -> SafetyResult | None:
-    """Rule: GRANT/REVOKE - all involved objects must be sandbox."""
-    if not _sql_search(r"\b(GRANT|REVOKE)\b", sql, re.IGNORECASE):
-        return None
+def _check_grant_revoke(sql: str, session_prefix: str) -> SafetyResult:
+    """Check the entire grant source and recipient before allowing the statement."""
+    tokens = _sql_tokens(sql)
+    grant = tokens[0].text.upper() == "GRANT"
+    separator = "TO" if grant else "FROM"
+    split = next(
+        (i for i, token in enumerate(tokens[1:], 1) if token.kind == "word" and token.text.upper() == separator),
+        None,
+    )
+    if split is None:
+        return SafetyResult(False, f"GRANT/REVOKE blocked: missing {separator} clause")
 
-    grant_identifiers: list[str] = []
-
-    on_clause = _sql_search(r"\bON\b(.*?)(?:\bTO\b|\bFROM\b|$)", sql, re.IGNORECASE | re.DOTALL)
-    if on_clause:
-        target = on_clause.group(1)
-        # The global wildcard (* / *.*) carries no identifier for the checks
-        # below to inspect and would grant authority over the whole warehouse,
-        # so it is rejected outright. <db>.* is inspected through its database.
-        if "*" in target and not re.fullmatch(r"\s*[`\'\"]?\w+[`\'\"]?\s*\.\s*\*\s*", target):
-            return SafetyResult(
-                allowed=False,
-                reason=f"GRANT/REVOKE blocked: global wildcard target '{target.strip()}' is not allowed",
-            )
-        on_identifiers = _grant_target_identifiers(target)
-        if on_identifiers is None:
-            return SafetyResult(
-                allowed=False,
-                reason="GRANT/REVOKE blocked: ON clause could not be tokenized safely",
-            )
-        grant_identifiers.extend(on_identifiers)
-
-    # A wildcard outside an object reference ("TO *", "ON *") names no
-    # identifier this rule can inspect, so it is rejected.
-    for star in _sql_finditer(r"\*", sql):
-        if not _sql_search(r"[`'\"]?\w+[`'\"]?\s*\.\s*$", sql[: star.start()]):
-            return SafetyResult(
-                allowed=False,
-                reason="GRANT/REVOKE blocked: wildcard is only supported as '<sandbox_object>.*'",
-            )
-
-    # Extract ROLE/TO/FROM patterns
-    for pattern in [
-        r"\bROLE\s+([`\'\"]?\w+[`\'\"]?)",
-        r"\bTO\s+([`\'\"]?\w+[`\'\"]?)",
-        r"\bFROM\s+([`\'\"]?\w+[`\'\"]?)",
+    source = tokens[1:split]
+    principal = tokens[split + 1 :]
+    if grant and [(token.kind, token.text.upper()) for token in principal[-3:]] == [
+        ("word", "WITH"), ("word", "GRANT"), ("word", "OPTION"),
     ]:
-        for match in _sql_finditer(pattern, sql, re.IGNORECASE):
-            grant_identifiers.append(match.group(1))
+        principal = principal[:-3]
+    is_role = bool(principal and principal[0].kind == "word" and principal[0].text.upper() == "ROLE")
+    if principal and principal[0].kind == "word" and principal[0].text.upper() in {"USER", "ROLE"}:
+        principal = principal[1:]
 
-    # Check all extracted identifiers
-    for identifier in grant_identifiers:
-        name, is_sandbox = _extract_identifier(identifier, session_prefix)
-        if not is_sandbox:
-            return SafetyResult(
-                allowed=False,
-                reason=f"GRANT/REVOKE blocked: '{name}' must start with {session_prefix}",
-            )
+    if len(principal) == 3 and not is_role and principal[1].text == "@" and principal[2].text.startswith("'"):
+        principal = principal[:1]
+    if len(principal) != 1 or principal[0].kind == "symbol":
+        return SafetyResult(False, "GRANT/REVOKE blocked: expected one named principal; lists and wildcards are unsupported")
 
-    if grant_identifiers:
-        return SafetyResult(allowed=True)
-    return None
+    names = [principal[0]]
+    on_index = next(
+        (i for i, token in enumerate(source) if token.kind == "word" and token.text.upper() == "ON"),
+        None,
+    )
+    if on_index is None:
+        if source and source[0].kind == "word" and source[0].text.upper() == "ROLE":
+            source = source[1:]
+        if len(source) != 1 or source[0].kind == "symbol":
+            return SafetyResult(False, "GRANT/REVOKE blocked: expected one named role")
+        names.extend(source)
+    else:
+        target = sql[source[on_index].end : tokens[split].start]
+        # A wildcard is supported only inside a sandbox database.
+        if "*" in target and not re.fullmatch(r"\s*[`'\"]?\w+[`'\"]?\s*\.\s*\*\s*", target):
+            return SafetyResult(False, "GRANT/REVOKE blocked: global wildcard target is not allowed")
+        targets = _grant_target_identifiers(target)
+        if not targets:
+            return SafetyResult(False, "GRANT/REVOKE blocked: ON clause has no verifiable target")
+        for target_name in targets:
+            name, is_sandbox = _extract_identifier(target_name, session_prefix)
+            if not is_sandbox:
+                return SafetyResult(False, f"GRANT/REVOKE blocked: '{name}' must start with {session_prefix}")
+
+    for token in names:
+        name = _identifier_value(token)
+        if not name.lower().startswith(session_prefix.lower()):
+            return SafetyResult(False, f"GRANT/REVOKE blocked: '{name}' must start with {session_prefix}")
+    return SafetyResult(True)
 
 
 def _check_dml(sql: str, session_prefix: str, cte_names: set[str] | None = None) -> SafetyResult | None:

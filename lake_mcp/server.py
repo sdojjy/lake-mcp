@@ -541,7 +541,6 @@ def main():
             # and bind port (defaults to 8001)
             mcp.run(
                 transport=transport,
-                host=config.mcp_bind_host,
                 port=config.mcp_bind_port,
                 **network_run_options(config, mcp.auth),
             )
