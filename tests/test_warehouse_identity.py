@@ -180,6 +180,22 @@ async def test_subject_routing_and_session_authorization(mapped_server, monkeypa
             assert result(await tool(sign("alice"), alice_session, "execute_sql", sql=f"CREATE DATABASE {prefix}test"))["status"] == "error"
             assert result(await tool(alice, alice_session, "execute_sql", sql=f"CREATE DATABASE {prefix}test"))["status"] == "success"
 
+            # Even lake:write plus local-admin environment flags cannot disable
+            # the storage boundary for an authenticated HTTP caller.
+            monkeypatch.setenv("LAKE_MCP_ALLOW_STDIO_ADMIN", "1")
+            previous = len(executed)
+            for sql in (
+                f"CREATE STAGE {prefix}s 's3://example.invalid/production/'",
+                f"REMOVE @{prefix}s",
+                f"CREATE TABLE {prefix}t EXTERNAL_LOCATION='s3://example.invalid/out/' AS SELECT 1",
+            ):
+                blocked = result(await tool(alice, alice_session, "execute_sql", sql=sql))
+                assert blocked["status"] == "error" and "blocked" in blocked["message"]
+            blocked = result(await tool(alice, alice_session, "create_stage", name=prefix + "s", url="s3://example.invalid/"))
+            assert blocked["status"] == "error"
+            assert len(executed) == previous
+            assert result(await tool(alice, alice_session, "create_stage", name=prefix + "internal"))["status"] == "success"
+
 
 @pytest.mark.asyncio
 async def test_sse_uses_the_authenticated_warehouse(mapped_server, monkeypatch):

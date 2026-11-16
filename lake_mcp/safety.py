@@ -727,7 +727,9 @@ def _check_grant_revoke(sql: str, session_prefix: str) -> SafetyResult:
     source = tokens[1:split]
     principal = tokens[split + 1 :]
     if grant and [(token.kind, token.text.upper()) for token in principal[-3:]] == [
-        ("word", "WITH"), ("word", "GRANT"), ("word", "OPTION"),
+        ("word", "WITH"),
+        ("word", "GRANT"),
+        ("word", "OPTION"),
     ]:
         principal = principal[:-3]
     is_role = bool(principal and principal[0].kind == "word" and principal[0].text.upper() == "ROLE")
@@ -814,18 +816,92 @@ def _check_dml(sql: str, session_prefix: str, cte_names: set[str] | None = None)
 
 
 def _check_remove_stage(sql: str, session_prefix: str) -> SafetyResult | None:
-    """Rule: REMOVE @stage must be on sandbox stage."""
-    match = _sql_search(r"\bREMOVE\s+@(\w+)", sql, re.IGNORECASE)
-    if not match:
+    """A stage name cannot establish ownership of the files it points to."""
+    return SafetyResult(False, "REMOVE blocked: safe mode cannot verify ownership of the underlying stage storage")
+
+
+def _check_storage_boundary(sql: str) -> SafetyResult | None:
+    """Reject caller-selected storage before any object-name rule can allow it.
+
+    The warehouse owns internal storage placement. A sandbox-prefixed name does
+    not make an external bucket, connection or attached table sandbox storage.
+    This is deliberately stateless: stages may predate this process, so even a
+    prefixed stage is insufficient evidence to authorize REMOVE.
+    """
+    header = _sql_search(
+        rf"^(CREATE(?:\s+OR\s+REPLACE)?|ALTER)\s+"
+        rf"(CONNECTION|CATALOG|STAGE|DATABASE|TABLE|(?:TRANSIENT\s+)?DYNAMIC\s+TABLE)\s+"
+        rf"(?:IF\s+(?:NOT\s+)?EXISTS\s+)?{IDENTIFIER_PATTERN}",
+        sql,
+        re.IGNORECASE,
+    )
+    if header is None:
+        return None
+    operation, kind = (value.upper() for value in header.groups())
+    if kind in {"CONNECTION", "CATALOG"}:
+        return SafetyResult(False, f"{operation} {kind} blocked: external storage configuration is unavailable in safe mode")
+
+    tokens = _sql_tokens(sql[header.end() :])
+    if kind == "STAGE":
+        # Databend also accepts a bare URI without URL=. Allow only the actual
+        # internal-stage grammar, not a blacklist of external URL spellings.
+        i = 0
+        if i < len(tokens) and tokens[i].kind == "word" and tokens[i].text.upper() == "FILE_FORMAT":
+            if [t.text for t in tokens[i + 1 : i + 3]] != ["=", "("]:
+                return SafetyResult(False, "STAGE blocked: invalid internal-stage file format")
+            end = _group_end(tokens, i + 2)
+            if end is None:
+                return SafetyResult(False, "STAGE blocked: invalid internal-stage file format")
+            i = end + 1
+        if i < len(tokens) and tokens[i].kind == "word" and tokens[i].text.upper() in {"COMMENT", "COMMENTS"}:
+            if i + 2 < len(tokens) and tokens[i + 1].text == "=" and tokens[i + 2].kind == "literal":
+                i += 3
+        if i != len(tokens):
+            return SafetyResult(False, "STAGE blocked: safe mode permits only internal stages without a URL or connection")
         return None
 
-    stage_name = match.group(1)
-    if stage_name.lower().startswith(session_prefix.lower()):
-        return SafetyResult(allowed=True)
-    return SafetyResult(
-        allowed=False,
-        reason=f"REMOVE blocked: stage '{stage_name}' must start with {session_prefix}",
-    )
+    # Column declarations are data/schema, not table storage options. Do not
+    # confuse a column named location or a DEFAULT URL string with an option.
+    if operation.startswith("CREATE") and tokens and tokens[0].text == "(":
+        end = _group_end(tokens, 0)
+        if end is None:
+            return SafetyResult(False, "TABLE blocked: invalid column declarations")
+        tokens = tokens[end + 1 :]
+
+    storage_keys = {
+        "URL",
+        "LOCATION",
+        "EXTERNAL_LOCATION",
+        "CONNECTION",
+        "CONNECTION_NAME",
+        "ENDPOINT_URL",
+        "TABLE_DATA_URI",
+        "SNAPSHOT_LOC",
+        "TEMP_PREFIX",
+        "DATABASE_ID",
+        "DEFAULT_STORAGE_CONNECTION",
+        "DEFAULT_STORAGE_PATH",
+    }
+    depth = 0
+    for i, token in enumerate(tokens):
+        word = _identifier_value(token).upper() if token.kind in {"word", "identifier", "literal"} else ""
+        # AS SELECT values and references do not configure the target storage.
+        if depth == 0 and token.kind == "word" and word == "AS":
+            break
+        assignment = i + 1 < len(tokens) and tokens[i + 1].text in {"=", ":"}
+        storage_option = word.startswith("STORAGE_") and word != "STORAGE_FORMAT"
+        if assignment and (word in storage_keys or storage_option or word.endswith("_LOCATION")):
+            return SafetyResult(False, f"{kind} blocked: caller-selected storage locations and connections are unavailable in safe mode")
+        if assignment and word == "ENGINE":
+            engines = {"DEFAULT"} if kind == "DATABASE" else {"FUSE", "MEMORY", "NULL"}
+            if i + 2 >= len(tokens) or _identifier_value(tokens[i + 2]).upper() not in engines:
+                return SafetyResult(False, f"{kind} blocked: safe mode permits only managed storage engines")
+        # CREATE TABLE t 's3://...' is valid too; its URI is not a key=value.
+        if operation.startswith("CREATE") and depth == 0 and token.kind == "literal" and (i == 0 or tokens[i - 1].text != "="):
+            return SafetyResult(False, "TABLE blocked: bare storage locations are unavailable in safe mode")
+        if token.kind == "symbol":
+            depth += (token.text == "(") - (token.text == ")")
+    return None
 
 
 # ============================================================================
@@ -966,12 +1042,14 @@ def _check_single_statement(sql: str) -> SafetyResult:
     session_prefix = get_session_prefix()
     network_write = getattr(_NESTED_STATE, "network_write", None)
     if network_write is not None and (
-        verb in {"GRANT", "REVOKE"}
-        or re.match(r"^(?:CREATE(?:\s+OR\s+REPLACE)?|ALTER|DROP)\s+(?:USER|ROLE)\b", statement, re.IGNORECASE)
+        verb in {"GRANT", "REVOKE"} or re.match(r"^(?:CREATE(?:\s+OR\s+REPLACE)?|ALTER|DROP)\s+(?:USER|ROLE)\b", statement, re.IGNORECASE)
     ):
         return SafetyResult(False, "Account and role administration is available only in local stdio mode")
     if network_write is False:
         return _check_read_only(statement, session_prefix) or SafetyResult(False, "This caller is read-only")
+    storage_denial = _check_storage_boundary(statement)
+    if storage_denial is not None:
+        return storage_denial
     routine_denial = _check_routine_definition(statement, session_prefix)
     if routine_denial is not None:
         return routine_denial

@@ -87,8 +87,16 @@ Add the standard config above to your Gemini CLI `settings.json`.
 | Statement scope | One statement per call. Stacked `;`-separated statements are rejected; use `execute_multi_sql` for batches. |
 | Tool arguments | `database`/`table`/`stage` accept plain identifiers or quoted ones (`` `my-db` ``, `"my-db"`) plus Databend's `$` character; `@~` / `@%table` stages and non-ASCII stage paths are supported. `url` and `connection_name` are escaped as string literals, and `filter` accepts a column compared with one scalar literal. Argument validation applies even when `LAKE_MCP_SAFE_MODE=false`. |
 | Write access | Only objects prefixed with `mcp_sandbox_{session_id}_*`. |
-| Sandbox objects | `CATALOG`, `DATABASE`, `TABLE`, `VIEW`, `STAGE`, `FUNCTION`, `USER`, `ROLE`, `TASK`, `PIPE`, `STREAM`, `CONNECTION`, `WAREHOUSE`, `SEQUENCE`, `PROCEDURE`, `DICTIONARY`, `TAG`, `FILE FORMAT`, `NETWORK POLICY`, `PASSWORD POLICY`, `MASKING POLICY`, `ROW ACCESS POLICY`, `NOTIFICATION INTEGRATION`, `WORKLOAD GROUP`, `DYNAMIC TABLE`, `INDEX` (AGGREGATING/INVERTED/NGRAM/VECTOR). |
-| Write rules | `CREATE/CREATE OR REPLACE/DROP/ALTER` on sandbox objects (every DROP/TRUNCATE target - a defensive check, the Databend parser itself rejects multi-target lists; plus `RENAME TO`/`SWAP WITH` destinations, where a bare name means "same database"); DML only on sandbox tables (`INSERT/UPDATE/DELETE/TRUNCATE/COPY/MERGE/REPLACE`); `GRANT/REVOKE` only on sandbox objects/principals and never on global wildcards; `ALTER ... SET|UNSET TAG` requires sandbox tag + target; `CREATE TASK|PIPE|DYNAMIC TABLE|INDEX ... AS` bodies are validated like top-level statements and `CREATE STREAM ... ON TABLE` only sandbox refs; `REMOVE @stage` only sandbox stages. |
+| Sandbox objects | `DATABASE`, managed `TABLE`, `VIEW`, internal `STAGE`, `FUNCTION`, `USER`, `ROLE`, `TASK`, `PIPE`, `STREAM`, `WAREHOUSE`, `SEQUENCE`, `PROCEDURE`, `DICTIONARY`, `TAG`, `FILE FORMAT`, `NETWORK POLICY`, `PASSWORD POLICY`, `MASKING POLICY`, `ROW ACCESS POLICY`, `NOTIFICATION INTEGRATION`, `WORKLOAD GROUP`, `DYNAMIC TABLE`, `INDEX` (AGGREGATING/INVERTED/NGRAM/VECTOR). |
+| Write rules | `CREATE/CREATE OR REPLACE/DROP/ALTER` on sandbox objects (every DROP/TRUNCATE target - a defensive check, the Databend parser itself rejects multi-target lists; plus `RENAME TO`/`SWAP WITH` destinations, where a bare name means "same database"); DML only on sandbox tables (`INSERT/UPDATE/DELETE/TRUNCATE/COPY/MERGE/REPLACE`); `GRANT/REVOKE` only on sandbox objects/principals and never on global wildcards; `ALTER ... SET|UNSET TAG` requires sandbox tag + target; `CREATE TASK|PIPE|DYNAMIC TABLE|INDEX ... AS` bodies are validated like top-level statements and `CREATE STREAM ... ON TABLE` only sandbox refs. |
+| Storage boundary | A sandbox name does not establish ownership of its storage. Safe mode rejects external stage creation, connection/catalog configuration, table location/connection overrides and unmanaged table engines. `REMOVE` is rejected even for prefixed stages because an existing stage may point at non-sandbox files. |
+
+### Storage safety changes
+
+- In safe mode, use `create_stage(name)` without a URL or connection to create an internal stage. `CREATE STAGE ... FILE_FORMAT=(...) COMMENT='...'` remains available through `execute_sql`. `create_stage(name, url, connection_name)` retains its arguments for trusted local administration, but safe mode rejects external storage bindings.
+- Safe mode allows managed/default tables and explicit `ENGINE=FUSE`, `MEMORY` or `NULL`; `STORAGE_FORMAT` remains available. It rejects storage location/connection overrides, database default storage connection/path changes, attached data or snapshot paths, bare storage URIs and external engines, including `CREATE OR REPLACE` and deferred SQL bodies. Stage configuration changes through `ALTER STAGE` are also restricted to the internal-stage options above.
+- `REMOVE` is unavailable in safe mode. A stage's prefix alone cannot prove that deleting its files is safe. Use a separately authorized storage cleanup procedure; do not disable safe mode for an untrusted agent.
+- Trusted local administration retains these operations only with both `LAKE_MCP_SAFE_MODE=false` and `LAKE_MCP_ALLOW_STDIO_ADMIN=1`. HTTP/SSE always enforces the sandbox and cannot use this opt-out.
 
 ## Upgrade notes (0.4.0)
 
@@ -112,7 +120,7 @@ This release is a minor bump because a few calls that used to be accepted are no
 | `get_session_sandbox_prefix` | Get current session prefix |
 | `list_session_sandbox_databases` | List sandbox databases |
 | `create_session_sandbox_database` | Create sandbox database |
-| `show_stages` / `list_stage_files` / `create_stage` | Stage management |
+| `show_stages` / `list_stage_files` / `create_stage` | Stage reads and internal stage creation in safe mode |
 | `show_connections` | List connections |
 
 ## Configuration

@@ -383,12 +383,10 @@ def test_escaped_stage_url_keeps_statement_single(monkeypatch):
     prefix = get_session_prefix()
     result = server.create_stage(name=f"{prefix}stage", url="s3://bucket'; DROP DATABASE production --")
 
-    # The quote can no longer close the URL literal, so the injected DDL never
-    # becomes its own statement and the sandbox-prefixed CREATE STAGE is allowed.
-    assert result["status"] == "success"
-    assert executed == [
-        f"CREATE STAGE {prefix}stage URL = 's3://bucket''; DROP DATABASE production --'",
-    ]
+    # Escaping keeps this one statement, but safe mode also rejects the external
+    # storage binding regardless of the stage's sandbox-prefixed name.
+    assert result["status"] == "error"
+    assert executed == []
 
 
 def test_show_tables_accepts_quoted_non_ascii_identifier(monkeypatch):

@@ -480,12 +480,12 @@ def show_connections():
     return _execute_sql("SHOW CONNECTIONS")
 
 
-def create_stage(name: str, url: str, connection_name: Optional[str] = None) -> dict:
+def create_stage(name: str, url: Optional[str] = None, connection_name: Optional[str] = None) -> dict:
     """
-    Create a TiDB Cloud Lake stage with a connection.
+    Create an internal stage, or an external stage in trusted local admin mode.
     Args:
         name: The stage name
-        url: The stage URL (e.g., 's3://bucket-name')
+        url: External stage URL; omit for an internal stage (required in safe mode)
         connection_name: Optional connection name to use
 
     Returns:
@@ -496,10 +496,14 @@ def create_stage(name: str, url: str, connection_name: Optional[str] = None) -> 
     rendered_name = _render_identifier(name, allow_qualified=False, unquoted_only=True)
     if rendered_name is None:
         return _invalid_argument("name", "expected a stage name, e.g. 'mystage' or 's$1'")
-    if not url or not url.strip():
+    if url is not None and not url.strip():
         return _invalid_argument("url", "expected a non-empty stage URL, e.g. 's3://bucket-name'")
+    if connection_name and url is None:
+        return _invalid_argument("connection_name", "an external stage connection requires a URL")
 
-    sql_parts = [f"CREATE STAGE {rendered_name}", f"URL = '{_escape_sql_literal(url)}'"]
+    sql_parts = [f"CREATE STAGE {rendered_name}"]
+    if url is not None:
+        sql_parts.append(f"URL = '{_escape_sql_literal(url)}'")
 
     if connection_name:
         # CONNECTION_NAME is a string literal, not an identifier: a connection

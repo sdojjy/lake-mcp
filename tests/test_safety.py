@@ -437,7 +437,6 @@ class TestAdditionalObjects:
             f"DROP NOTIFICATION INTEGRATION {prefix}ni",
             f"CREATE WORKLOAD GROUP {prefix}wg",
             f"DROP WORKLOAD GROUP {prefix}wg",
-            f"CREATE CATALOG {prefix}cat TYPE=HIVE CONNECTION = (a='b')",
             f"DROP CATALOG {prefix}cat",
         ]
         for sql in sqls:
