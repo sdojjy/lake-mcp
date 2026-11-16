@@ -353,9 +353,12 @@ def show_databases():
 
 
 _FILTER_ATOM = r"(?:'(?:[^'\\]|\\.|'')*'|[+-]?[0-9]+(?:\.[0-9]+)?|TRUE|FALSE|NULL)"
+# Symbolic and keyword operators consume their own whitespace. Possessive
+# quantifiers prevent a failed match from repartitioning long whitespace runs
+# (or the column name); Python 3.12+ is already required by this package.
 _METADATA_FILTER = re.compile(
-    rf"(?P<column>[A-Za-z_][A-Za-z0-9_]*|[0-9]+)\s*"
-    rf"(?P<op><>|!=|<=|>=|=|<|>|\s+(?:NOT\s+)?(?:LIKE|ILIKE)\s+)\s*"
+    rf"(?P<column>[A-Za-z_][A-Za-z0-9_]*+|[0-9]++)"
+    rf"(?:\s*+(?:<>|!=|<=|>=|=|<|>)\s*+|\s++(?:NOT\s++)?(?:LIKE|ILIKE)\s++)"
     rf"(?P<value>{_FILTER_ATOM})",
     re.IGNORECASE,
 )
